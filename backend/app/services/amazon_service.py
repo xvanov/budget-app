@@ -756,6 +756,15 @@ async def _pair_targets(db, refund: Dict[str, Any]) -> List[Dict[str, Any]]:
     2. the attributed item's own charge row,
     3. any charge row the order matched, smallest first, so a refund pairs with the
        shipment it came out of rather than the largest charge on the order.
+    4. FALLBACK: an unpaired Amazon expense row of the EXACT same amount, dated on
+       or before the refund, most recent first. Needed because 42 matched refunds
+       belong to orders whose charge was never matched to a transaction at all —
+       the charge predates the imported statements, or a gift-card balance made it a
+       different amount. Their refunds had nothing to pair with, so $1,265.74 of
+       returned money sat in the ledger as income for purchases it could not point
+       at. An exact amount on the same merchant, earlier in time, is strong enough
+       evidence to cancel the two out; it can attach the reversal to the wrong
+       identically-priced item, which is why it is last and why it is exact-only.
 
     No ``entity_type`` filter, deliberately. ``services/refund_pairs`` skips
     ``transfer`` rows and must — it pairs on merchant and date, and internal
@@ -781,9 +790,32 @@ async def _pair_targets(db, refund: Dict[str, Any]) -> List[Dict[str, Any]]:
     )
     order_charges = [r[0] for r in await cursor.fetchall()]
 
+    # Fallback candidates: same amount, same merchant family, not already paired,
+    # and economically no later than the refund. Ordered most-recent-first so a
+    # refund attaches to the nearest matching purchase.
+    fallback: List[int] = []
+    # Filter the Nones FIRST. An attributed refund whose item has neither a split
+    # child nor a matched charge yields [None, None], which is truthy — so testing
+    # `candidates` directly disabled the fallback for exactly the refunds that
+    # needed it.
+    real_candidates = [c for c in candidates if c]
+    if not real_candidates and not order_charges:
+        amount = abs(int(refund.get("amount_cents") or 0))
+        cursor = await db.execute(
+            """SELECT t.id FROM transactions t
+               WHERE t.amount_cents = -?
+                 AND t.refund_match_id IS NULL
+                 AND (LOWER(t.merchant) LIKE '%amazon%' OR LOWER(t.description) LIKE '%amazon%')
+                 AND COALESCE(t.transaction_date, t.posted_date) <= ?
+               ORDER BY COALESCE(t.transaction_date, t.posted_date) DESC, t.id DESC
+               LIMIT 5""",
+            (amount, refund.get("refund_date") or "9999-12-31"),
+        )
+        fallback = [r[0] for r in await cursor.fetchall()]
+
     seen: set = set()
     ordered: List[Dict[str, Any]] = []
-    for txn_id in [c for c in candidates if c] + sorted(order_charges):
+    for txn_id in real_candidates + sorted(order_charges) + fallback:
         if txn_id in seen:
             continue
         seen.add(txn_id)

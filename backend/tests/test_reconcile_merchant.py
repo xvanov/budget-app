@@ -255,3 +255,66 @@ async def test_a_reconciliation_survives_a_later_refund_detect(test_client):
 async def test_an_empty_pattern_is_rejected(test_client):
     resp = test_client.post("/api/refunds/reconcile-merchant?pattern=%20%20")
     assert resp.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Settlement date vs the date the money actually moved
+# --------------------------------------------------------------------------- #
+
+def test_a_represented_charge_pairs_with_the_credit_that_reversed_it():
+    """The live defect: a disputed series re-debited on ONE day, months later.
+
+    The bank provisionally credited a disputed subscription, then re-debited the
+    whole series in a single batch: fourteen rows all posted 2026-07-15 whose
+    transaction_date values ran 2025-01-28 .. 2026-02-07, one per original monthly
+    charge. Comparing POSTED dates made every re-presented charge look newer than
+    the credits reversing it, so "a refund cannot precede its charge" rejected all
+    of them and $267 of already-reversed spending stayed on the books as real.
+    """
+    # Charges: posted on one day, but they happened a year earlier.
+    charges = [
+        {"id": i, "amount_cents": -2000, "posted_date": "2026-07-15",
+         "transaction_date": f"2025-{m:02d}-07", "merchant": MARK,
+         "description": MARK, "entity_type": "expense", "category_path": "Other"}
+        for i, m in enumerate(range(1, 5), start=1)
+    ]
+    # Credits posted a week BEFORE the charges settled, but after they occurred.
+    credits = [
+        {"id": 100 + i, "amount_cents": 2000, "posted_date": "2026-07-09",
+         "transaction_date": "2026-07-08", "merchant": MARK,
+         "description": MARK, "entity_type": "income", "category_path": "Other"}
+        for i in range(4)
+    ]
+
+    pairs = reconcile_exact(charges + credits)
+    assert len(pairs) == 4, (
+        f"expected all four re-presented charges to pair, got {len(pairs)}")
+    assert {p["charge_id"] for p in pairs} == {c["id"] for c in charges}
+
+
+def test_a_refund_still_cannot_precede_the_charge_economically():
+    """The guard must survive the fix: judged on when the money moved."""
+    rows = [
+        {"id": 1, "amount_cents": -2000, "posted_date": "2026-01-10",
+         "transaction_date": "2026-01-09", "merchant": MARK, "description": MARK,
+         "entity_type": "expense", "category_path": "Other"},
+        # Credit happened BEFORE the purchase, however it settled.
+        {"id": 2, "amount_cents": 2000, "posted_date": "2026-06-01",
+         "transaction_date": "2025-12-01", "merchant": MARK, "description": MARK,
+         "entity_type": "income", "category_path": "Other"},
+    ]
+    assert reconcile_exact(rows) == []
+
+
+def test_posted_date_is_used_when_no_transaction_date_exists():
+    """CSV imports often have no transaction_date; behaviour must not change."""
+    rows = [
+        {"id": 1, "amount_cents": -2000, "posted_date": "2025-01-08",
+         "transaction_date": None, "merchant": MARK, "description": MARK,
+         "entity_type": "expense", "category_path": "Other"},
+        {"id": 2, "amount_cents": 2000, "posted_date": "2026-05-07",
+         "transaction_date": None, "merchant": MARK, "description": MARK,
+         "entity_type": "income", "category_path": "Other"},
+    ]
+    pairs = reconcile_exact(rows)
+    assert len(pairs) == 1 and pairs[0]["charge_id"] == 1

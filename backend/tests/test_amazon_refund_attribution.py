@@ -779,3 +779,110 @@ async def test_attribute_refunds_endpoint_reports_all_three_steps(test_client):
     assert "by_strategy" in body["attribution"]
     for key in ("paired", "already_paired", "no_reversible_row"):
         assert key in body["pairing"], body
+
+
+# --------------------------------------------------------------------------- #
+# Pairing fallback: a refund whose order has no matched charge
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_a_refund_with_no_order_charge_pairs_by_exact_amount(test_client):
+    """42 matched refunds belonged to orders whose charge was never matched.
+
+    Their charge predates the imported statements, or a gift-card balance made the
+    card charge a different amount, so the order route had nothing to offer and
+    $1,265.74 of returned money sat in the ledger as income for purchases it could
+    not point at. An exact amount on the same merchant, earlier in time, is enough
+    to cancel the two out.
+    """
+    from app.database import get_db
+    from app.services import amazon_service
+    db = await get_db()
+    ids = []
+    order = "111-FALLBACK-PAIR-1"
+    try:
+        cursor = await db.execute(
+            """INSERT INTO transactions
+               (source_platform, source_file, account_id, posted_date, transaction_date,
+                amount_cents, merchant, description, category_path, entity_type,
+                business_context)
+               VALUES ('plaid','f.csv','card-0001','2033-02-10','2033-02-09',-6433,
+                       'Amazon','Amazon','Shopping','expense','personal')""")
+        charge_id = cursor.lastrowid; ids.append(charge_id)
+        cursor = await db.execute(
+            """INSERT INTO transactions
+               (source_platform, source_file, account_id, posted_date, transaction_date,
+                amount_cents, merchant, description, category_path, entity_type,
+                business_context)
+               VALUES ('plaid','f.csv','card-0001','2033-03-15','2033-03-14',6433,
+                       'Amazon','Amazon','Other Income','income','personal')""")
+        credit_id = cursor.lastrowid; ids.append(credit_id)
+        # A refund record whose order has NO matched charge row at all.
+        await db.execute(
+            """INSERT INTO amazon_refunds
+               (owner, order_id, amount_cents, refund_date, reason, fingerprint,
+                matched_transaction_id)
+               VALUES ('kalin', ?, 6433, '2033-03-14', 'Customer return', ?, ?)""",
+            (order, f"fp-fallback-{order}", credit_id))
+        await db.commit()
+
+        await amazon_service.pair_refunds(db)
+
+        cursor = await db.execute(
+            "SELECT refund_match_id, refund_role FROM transactions WHERE id=?", (credit_id,))
+        credit = dict(await cursor.fetchone())
+        assert credit["refund_match_id"] == charge_id, (
+            f"refund should have paired with the same-amount charge, got {credit}")
+        assert credit["refund_role"] == "credit"
+    finally:
+        for txn_id in ids:
+            await db.execute("DELETE FROM transactions WHERE id=?", (txn_id,))
+        await db.execute("DELETE FROM amazon_refunds WHERE order_id=?", (order,))
+        await db.commit()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_the_fallback_never_pairs_a_charge_that_came_later(test_client):
+    """A refund cannot reverse a purchase that had not happened yet."""
+    from app.database import get_db
+    from app.services import amazon_service
+    db = await get_db()
+    ids = []
+    order = "111-FALLBACK-PAIR-2"
+    try:
+        cursor = await db.execute(
+            """INSERT INTO transactions
+               (source_platform, source_file, account_id, posted_date, transaction_date,
+                amount_cents, merchant, description, category_path, entity_type,
+                business_context)
+               VALUES ('plaid','f.csv','card-0001','2033-06-10','2033-06-09',-7777,
+                       'Amazon','Amazon','Shopping','expense','personal')""")
+        ids.append(cursor.lastrowid)
+        cursor = await db.execute(
+            """INSERT INTO transactions
+               (source_platform, source_file, account_id, posted_date, transaction_date,
+                amount_cents, merchant, description, category_path, entity_type,
+                business_context)
+               VALUES ('plaid','f.csv','card-0001','2033-04-15','2033-04-14',7777,
+                       'Amazon','Amazon','Other Income','income','personal')""")
+        credit_id = cursor.lastrowid; ids.append(credit_id)
+        await db.execute(
+            """INSERT INTO amazon_refunds
+               (owner, order_id, amount_cents, refund_date, reason, fingerprint,
+                matched_transaction_id)
+               VALUES ('kalin', ?, 7777, '2033-04-14', 'Customer return', ?, ?)""",
+            (order, f"fp-fallback-{order}", credit_id))
+        await db.commit()
+
+        await amazon_service.pair_refunds(db)
+
+        cursor = await db.execute(
+            "SELECT refund_match_id FROM transactions WHERE id=?", (credit_id,))
+        assert dict(await cursor.fetchone())["refund_match_id"] is None
+    finally:
+        for txn_id in ids:
+            await db.execute("DELETE FROM transactions WHERE id=?", (txn_id,))
+        await db.execute("DELETE FROM amazon_refunds WHERE order_id=?", (order,))
+        await db.commit()
+        await db.close()

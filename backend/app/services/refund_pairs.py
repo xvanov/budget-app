@@ -52,6 +52,21 @@ def normalize_merchant(name: Optional[str]) -> str:
     return re.sub(r"s$", "", text) or "unknown"
 
 
+def economic_date(row: Dict[str, Any]) -> Optional[str]:
+    """When a transaction actually HAPPENED, not when the bank printed it.
+
+    ``posted_date`` is the settlement date, and for a re-presented charge those can
+    be a year apart. A real case: a disputed subscription was provisionally credited,
+    then the bank re-debited the whole series on one day — fourteen rows all posted
+    2026-07-15 whose ``transaction_date`` values ran from 2025-01-28 to 2026-02-07,
+    one per original monthly charge. Comparing posted dates made every one of those
+    charges look like it happened AFTER the credits that reversed it, so the
+    "a refund cannot precede its charge" rule refused to pair them and $267 of
+    already-reversed spending stayed on the books.
+    """
+    return row.get("transaction_date") or row.get("posted_date")
+
+
 def _days_between(later: Optional[str], earlier: Optional[str]) -> Optional[int]:
     try:
         a = datetime.strptime(str(later)[:10], "%Y-%m-%d")
@@ -82,7 +97,7 @@ def find_pairs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     pairs: List[Dict[str, Any]] = []
 
     # Oldest credit first so an early refund claims the charge it actually undid.
-    for credit in sorted(credits, key=lambda r: (r.get("posted_date") or "", r.get("id") or 0)):
+    for credit in sorted(credits, key=lambda r: (economic_date(r) or "", r.get("id") or 0)):
         key = normalize_merchant(credit.get("merchant") or credit.get("description"))
         credit_amount = int(credit["amount_cents"])
         candidates = []
@@ -92,7 +107,8 @@ def find_pairs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             charge_amount = abs(int(charge["amount_cents"]))
             if credit_amount > charge_amount:
                 continue  # a credit bigger than the charge is not that charge's refund
-            gap = _days_between(credit.get("posted_date"), charge.get("posted_date"))
+            # Economic dates, not settlement dates — see economic_date().
+            gap = _days_between(economic_date(credit), economic_date(charge))
             if gap is None or gap < 0 or gap > REFUND_WINDOW_DAYS:
                 continue
             is_partial = charge_amount != credit_amount
@@ -160,13 +176,13 @@ def reconcile_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         (r for r in rows
          if int(r.get("amount_cents") or 0) < 0
          and (r.get("entity_type") or "") not in SKIP_ENTITY_TYPES),
-        key=lambda r: (r.get("posted_date") or "", r.get("id") or 0),
+        key=lambda r: (economic_date(r) or "", r.get("id") or 0),
     )
     credits = sorted(
         (r for r in rows
          if int(r.get("amount_cents") or 0) > 0
          and (r.get("entity_type") or "") not in SKIP_ENTITY_TYPES),
-        key=lambda r: (r.get("posted_date") or "", r.get("id") or 0),
+        key=lambda r: (economic_date(r) or "", r.get("id") or 0),
     )
 
     by_amount: Dict[int, List[Dict[str, Any]]] = {}
@@ -179,7 +195,7 @@ def reconcile_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         queue = by_amount.get(amount) or []
         match = None
         for index, charge in enumerate(queue):
-            gap = _days_between(credit.get("posted_date"), charge.get("posted_date"))
+            gap = _days_between(economic_date(credit), economic_date(charge))
             if gap is None or gap < 0:
                 continue  # a refund cannot predate its charge
             match = queue.pop(index)
@@ -192,7 +208,7 @@ def reconcile_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "charge_cents": int(match["amount_cents"]),
             "credit_cents": amount,
             "partial": False,
-            "days_to_refund": _days_between(credit.get("posted_date"), match.get("posted_date")),
+            "days_to_refund": _days_between(economic_date(credit), economic_date(match)),
             "merchant": match.get("merchant") or credit.get("merchant") or "",
             "category_path": match.get("category_path"),
             "charge_date": match.get("posted_date"),
@@ -222,8 +238,8 @@ async def reconcile_merchant(db, pattern: str, scope: Optional[str] = "plaid",
 
     scope_sql, _p, effective_scope, _n = await resolve_scope(db, scope)
     cursor = await db.execute(
-        f"""SELECT id, posted_date, amount_cents, merchant, description, category_path,
-                   entity_type, account_id
+        f"""SELECT id, posted_date, transaction_date, amount_cents, merchant, description,
+                   category_path, entity_type, account_id
             FROM transactions t
             WHERE linked_transaction_id IS NULL
               AND refund_match_id IS NULL
@@ -289,8 +305,8 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
 
     scope_sql, _p, effective_scope, _n = await resolve_scope(db, scope)
     cursor = await db.execute(
-        f"""SELECT id, posted_date, amount_cents, merchant, description, category_path,
-                   entity_type, account_id
+        f"""SELECT id, posted_date, transaction_date, amount_cents, merchant, description,
+                   category_path, entity_type, account_id
             FROM transactions t
             WHERE linked_transaction_id IS NULL {scope_sql}"""
     )
