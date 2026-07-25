@@ -1,0 +1,62 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    volumes:
+      - budget_data:/data
+      - ./samples:/app/samples:ro
+      - ./budget_context.md:/data/budget_context.md
+      - ./backend/tests:/app/tests:ro
+      - ${HOME}/.opencode:${HOME}/.opencode:ro
+      - ${HOME}/.local/bin/claude:/usr/local/bin/claude:ro
+      - ${HOME}/.opencode/bin/opencode:/usr/local/bin/opencode:ro
+      - ${HOME}/.claude:${HOME}/.claude:ro
+      - ${HOME}/.config/opencode:${HOME}/.config/opencode:ro
+    # Plaid credentials + ENCRYPTION_KEY come from .env (gitignored). Values are
+    # never referenced in code outside app/services/plaid_client.py and crypto.py.
+    env_file:
+      - .env
+    environment:
+      - DB_PATH=/data/budget.db
+      - BUDGET_CONTEXT_PATH=/data/budget_context.md
+      - SAMPLES_DIR=/app/samples
+      - AMAZON_DIR=/app/samples/amazon
+      - PLAID_SYNC_INTERVAL_MIN=${PLAID_SYNC_INTERVAL_MIN:-360}
+      # Optional: account display names and kinds, applied on every boot.
+      # Startup derives a name and kind for each account it finds in the data
+      # ("Bank 1234", checking/credit), which is enough for a first run but
+      # cannot know that an account is your residence — and `real_estate`
+      # changes the net-worth arithmetic. Point this at a JSON file (mount it,
+      # keep it out of the repo) or pass inline JSON:
+      #   {"bank-1234": {"display_name": "Everyday Checking", "kind": "checking"}}
+      # Same payload as POST /api/accounts/meta. Renaming in the UI persists
+      # too; this exists so a rebuild-from-empty comes back already labelled.
+      - ACCOUNT_META_JSON=${ACCOUNT_META_JSON:-}
+      - HOME=${HOME}
+      - PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  budget_data:
+    name: budget_app_data

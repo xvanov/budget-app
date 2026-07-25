@@ -1,0 +1,260 @@
+/* Design System — Colors & Type
+ * Extracted from @dod/shared/src/index.css (Drafting on Demand frontend).
+ * Two themes: light (white + blue primary) and dark (purple-based).
+ * Brand accent: orange (#f65524) — used sparingly in charts and on the login brand panel.
+ */
+
+/* ─── Fonts ──────────────────────────────────────────────────────────────── */
+/* The product uses Roboto (variable) and Roboto Mono (variable) via @fontsource.
+ * Local .woff2 files in fonts/ — variable weight, italic, and Roboto's width axis.
+ */
+
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("fonts/roboto-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Roboto";
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("fonts/roboto-latin-wght-italic.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Roboto";
+  font-style: normal;
+  font-weight: 100 900;
+  font-stretch: 75% 100%;
+  font-display: swap;
+  src: url("fonts/roboto-latin-wdth-normal.woff2") format("woff2-variations");
+}
+
+@font-face {
+  font-family: "Roboto Mono";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url("fonts/roboto-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "Roboto Mono";
+  font-style: italic;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url("fonts/roboto-mono-latin-wght-italic.woff2") format("woff2-variations");
+}
+
+:root {
+  /* ─── Light theme (ERP-mapped) ─────────────────────────────────────────── */
+  --background: #ffffff;
+  --foreground: hsl(210, 10%, 17%);          /* gray-800 */
+  --card: #ffffff;
+  --card-foreground: hsl(210, 10%, 17%);
+  --popover: #ffffff;
+  --popover-foreground: hsl(210, 10%, 17%);
+
+  --primary: hsl(201, 96%, 32%);              /* blue-700 — ~5.5:1 on white */
+  --primary-foreground: #ffffff;
+  --secondary: hsl(210, 17%, 95%);            /* gray-100 */
+  --secondary-foreground: hsl(210, 10%, 17%);
+  --muted: hsl(210, 20%, 97%);                /* gray-50 */
+  --muted-foreground: hsl(210, 10%, 50%);     /* gray-600 */
+  --accent: hsl(210, 14%, 89%);               /* gray-200 */
+  --accent-foreground: hsl(210, 10%, 17%);
+  --destructive: hsl(358, 63%, 49%);          /* red-500 */
+  --border: hsl(210, 14%, 83%);               /* ~gray-300 */
+  --input: rgb(173, 181, 189);                /* gray-400 */
+  --ring: hsl(201, 96%, 32%);                 /* blue-700 */
+
+  /* Channel triples — needed so Tailwind alpha modifiers (e.g. bg-primary/80)
+   * can compose with these tokens via rgb(var(--*-rgb) / <alpha-value>). */
+  --background-rgb: 255 255 255;
+  --foreground-rgb: 39 43 48;                 /* hsl(210,10%,17%) */
+  --card-rgb: 255 255 255;
+  --card-foreground-rgb: 39 43 48;
+  --primary-rgb: 4 110 156;                   /* hsl(201,96%,32%) */
+  --primary-foreground-rgb: 255 255 255;
+  --secondary-rgb: 240 242 244;               /* hsl(210,17%,95%) */
+  --secondary-foreground-rgb: 39 43 48;
+  --muted-rgb: 245 247 248;                   /* hsl(210,20%,97%) */
+  --muted-foreground-rgb: 115 123 132;        /* hsl(210,10%,50%) */
+  --accent-rgb: 222 226 230;                  /* hsl(210,14%,89%) */
+  --accent-foreground-rgb: 39 43 48;
+  --destructive-rgb: 200 46 53;               /* hsl(358,63%,49%) */
+  --border-rgb: 207 213 219;                  /* hsl(210,14%,83%) */
+  --ring-rgb: 4 110 156;
+
+  /* Charts */
+  --chart-1: hsl(198, 93%, 60%);              /* blue-400 */
+  --chart-2: hsl(199, 89%, 48%);              /* blue-500 */
+  --chart-3: hsl(131, 57%, 44%);              /* green-500 */
+  --chart-4: hsl(45, 100%, 50%);              /* yellow-500 */
+  --chart-5: hsl(358, 63%, 49%);              /* red-500 */
+
+  /* Brand accent */
+  --accent-orange: #f65524;
+  --accent-orange-light: #fff3e0;
+  --login-brand-bg: #171717;                  /* login page brand panel */
+  --login-subtitle: #e8611a;                  /* "Admin Portal" tagline color */
+
+  /* Sidebar — signature purple in light mode */
+  --sidebar: hsl(240, 15%, 24%);              /* dark-purple-600 */
+  --sidebar-foreground: hsl(210, 20%, 97%);
+  --sidebar-primary: hsl(201, 96%, 32%);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: hsl(240, 15%, 34%);       /* dark-purple-500 */
+  --sidebar-accent-foreground: hsl(210, 20%, 97%);
+  --sidebar-border: hsl(240, 15%, 34%);
+  --sidebar-ring: hsl(201, 96%, 32%);
+  --sidebar-banner: hsl(240, 15%, 21%);       /* dark-purple-700 — brand strip */
+
+  /* Dark-purple color ramp (exposed as tokens; used chiefly in sidebar + dark mode surfaces) */
+  --dark-purple-900: hsl(240, 16%, 12%);
+  --dark-purple-800: hsl(240, 16%, 17%);
+  --dark-purple-700: hsl(240, 15%, 21%);
+  --dark-purple-600: hsl(240, 15%, 24%);
+  --dark-purple-500: hsl(240, 15%, 34%);
+  --dark-purple-400: hsl(240, 15%, 44%);
+  --dark-purple-300: hsl(240, 15%, 63%);
+  --dark-purple-200: hsl(240, 19%, 78%);
+  --dark-purple-100: hsl(240, 15%, 93%);
+
+  /* Radius scale (base 6px) */
+  --radius: 6px;
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --radius-xl: 10px;
+  --radius-2xl: 14px;
+  --radius-3xl: 18px;
+  --radius-4xl: 22px;
+  --radius-pill: 9999px;
+
+  /* Spacing scale (base unit 4px) */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Type scale */
+  --font-sans: "Roboto", "Roboto Variable", system-ui, sans-serif;
+  --font-mono: "Roboto Mono", "Roboto Mono Variable", ui-monospace, monospace;
+
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+  --text-4xl: 36px;
+  --text-5xl: 48px;
+
+  /* Weights actually used by the product */
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --weight-extrabold: 800;
+
+  /* Elevation — product uses very subtle shadows; never dramatic */
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-sm: 0 1px 3px 0 rgb(0 0 0 / 0.08), 0 1px 2px -1px rgb(0 0 0 / 0.04);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+  --shadow-ring-faint: 0 0 0 1px rgb(0 0 0 / 0.06);
+}
+
+.dark {
+  /* ─── Dark theme (purple-based, ERP-derived) ──────────────────── */
+  --background: hsl(240, 16%, 12%);           /* purple-900 */
+  --foreground: hsl(210, 20%, 97%);           /* gray-50 */
+  --card: hsl(240, 16%, 17%);                 /* purple-800 */
+  --card-foreground: hsl(210, 20%, 97%);
+  --popover: hsl(240, 16%, 17%);
+  --popover-foreground: hsl(210, 20%, 97%);
+
+  --primary: hsl(199, 89%, 48%);              /* blue-500 */
+  --primary-foreground: #ffffff;
+  --secondary: hsl(240, 15%, 21%);            /* purple-700 */
+  --secondary-foreground: hsl(210, 20%, 97%);
+  --muted: hsl(240, 16%, 17%);
+  --muted-foreground: hsl(240, 15%, 63%);     /* purple-300 */
+  --accent: hsl(240, 15%, 24%);
+  --accent-foreground: hsl(210, 20%, 97%);
+  --destructive: hsl(360, 79%, 64%);          /* red-400 */
+  --border: hsl(240, 15%, 28%);
+  --input: hsl(240, 15%, 34%);
+  --ring: hsl(199, 89%, 48%);
+
+  --chart-1: hsl(199, 95%, 74%);
+  --chart-2: hsl(199, 89%, 48%);
+  --chart-3: hsl(130, 64%, 62%);
+  --chart-4: hsl(46, 97%, 65%);
+  --chart-5: hsl(360, 79%, 64%);
+
+  --sidebar: hsl(240, 16%, 12%);
+  --sidebar-foreground: hsl(210, 20%, 97%);
+  --sidebar-primary: hsl(199, 89%, 48%);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: hsl(240, 16%, 17%);
+  --sidebar-accent-foreground: hsl(210, 20%, 97%);
+  --sidebar-border: hsl(240, 15%, 21%);
+  --sidebar-ring: hsl(199, 89%, 48%);
+  --sidebar-banner: hsl(240, 16%, 12%);
+
+  /* Channel triples for dark theme — same purpose as in :root */
+  --background-rgb: 26 26 36;                 /* hsl(240,16%,12%) */
+  --foreground-rgb: 245 247 248;              /* hsl(210,20%,97%) */
+  --card-rgb: 36 36 50;                       /* hsl(240,16%,17%) */
+  --card-foreground-rgb: 245 247 248;
+  --primary-rgb: 14 165 233;                  /* hsl(199,89%,48%) */
+  --primary-foreground-rgb: 255 255 255;
+  --secondary-rgb: 45 45 64;                  /* hsl(240,15%,21%) */
+  --secondary-foreground-rgb: 245 247 248;
+  --muted-rgb: 36 36 50;
+  --muted-foreground-rgb: 156 156 184;        /* hsl(240,15%,63%) */
+  --accent-rgb: 51 51 73;                     /* hsl(240,15%,24%) */
+  --accent-foreground-rgb: 245 247 248;
+  --destructive-rgb: 232 90 95;               /* hsl(360,79%,64%) */
+  --border-rgb: 60 60 81;                     /* hsl(240,15%,28%) */
+  --ring-rgb: 14 165 233;
+}
+
+/* ─── Semantic typography roles ────────────────────────────────────────── */
+body,
+.body {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);      /* product body is 14px */
+  line-height: 1.5;
+  color: var(--foreground);
+  background: var(--background);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.h1, h1 { font: var(--weight-bold) var(--text-2xl)/1.2 var(--font-sans); letter-spacing: -0.01em; }
+.h2, h2 { font: var(--weight-semibold) var(--text-xl)/1.25 var(--font-sans); }
+.h3, h3 { font: var(--weight-semibold) var(--text-lg)/1.3 var(--font-sans); }
+.h4, h4 { font: var(--weight-medium) var(--text-base)/1.35 var(--font-sans); }
+.card-title { font: var(--weight-medium) var(--text-base)/1.4 var(--font-sans); }
+.card-title-sm { font: var(--weight-medium) var(--text-sm)/1.4 var(--font-sans); }
+
+.label-muted { font: var(--weight-medium) var(--text-xs)/1.4 var(--font-sans); color: var(--muted-foreground); letter-spacing: 0.04em; text-transform: uppercase; }
+.p, p { font: var(--weight-normal) var(--text-sm)/1.5 var(--font-sans); }
+.p-xs { font: var(--weight-normal) var(--text-xs)/1.45 var(--font-sans); color: var(--muted-foreground); }
+
+.mono, code, kbd, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.stat { font: var(--weight-bold) var(--text-3xl)/1.1 var(--font-sans); font-variant-numeric: tabular-nums; }
+.stat-sm { font: var(--weight-semibold) var(--text-2xl)/1.1 var(--font-sans); font-variant-numeric: tabular-nums; }
+
+.brand-wordmark { font: var(--weight-normal) var(--text-xs)/1 var(--font-sans); letter-spacing: 0.2em; text-transform: uppercase; }

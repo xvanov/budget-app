@@ -1,0 +1,39 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Node dependencies
+node_modules/
+
+# Frontend build output
+frontend/dist/
+
+# Personal financial data — never commit
+samples/*
+!samples/.gitkeep
+budget_context.md
+
+# Build log. Kept on disk because the Ralph harness reads it (see PROMPT.md), but
+# not published: entries quote real balances, account ids and merchant names from
+# whatever data was on the box that day.
+activity.md
+
+# App screenshots (may show real financial figures on screen)
+/screenshots/
+
+# Test run artifacts
+test-results/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Machine-specific Docker Compose overrides
+docker-compose.override.yml
+
+# Editor / OS
+.DS_Store
+*.swp
+.venv/
