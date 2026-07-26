@@ -173,25 +173,24 @@ async def _compute_current_balances(db):
     plaid = await _plaid_balances(db)
 
     def _line(aid, name, kind):
-        """One account line, with WHERE its balance came from stated on it.
+        """One account line, or None if its balance is not actually known.
 
-        Precedence is Plaid's reported balance, then a scope-deduped flow sum.
-        The basis travels with the number because the two are not comparable:
-        one is a balance, the other is only the net of the transactions we happen
-        to hold, and a total mixing them silently is how this page came to be
-        wrong by six figures.
+        Only a LINKED account has a balance. For anything else the database holds
+        the net of whatever transactions were imported, which is not a balance and
+        must not be presented as one — the owner's instruction is explicit: "don't
+        take into account accounts that aren't connected via Plaid… you shouldn't
+        be making up things." So an unlinked account is omitted from net worth
+        entirely and reported separately under ``unlinked_accounts``, where it can
+        be seen without contaminating the total.
         """
         entry = plaid.get(aid)
-        if entry is not None:
-            return {"id": aid, "name": name, "kind": kind,
-                    "balance": entry["cents"], "balance_basis": "plaid"}
-        flow = balances.get(aid) or {"cents": 0, "deduped": False}
-        return {"id": aid, "name": name, "kind": kind, "balance": flow["cents"],
-                "balance_basis": "flow_sum",
-                "balance_note": "Net of imported transactions, not a real balance — "
-                                "this account is not linked, so no opening balance is known."}
+        if entry is None:
+            return None
+        return {"id": aid, "name": name, "kind": kind,
+                "balance": entry["cents"], "balance_basis": "plaid"}
 
     accounts = []
+    unlinked = []
     for meta in await _net_worth_accounts(db):
         aid = meta["account_id"]
         if meta["kind"] == "real_estate":
@@ -209,10 +208,16 @@ async def _compute_current_balances(db):
             })
             entry = plaid.get(aid)
             cash_name = (entry or {}).get("name") or f"Account {aid}"
-            accounts.append(_line(aid, cash_name, _APP_KIND.get(
-                (entry or {}).get("kind"), "checking")))
+            line = _line(aid, cash_name, _APP_KIND.get((entry or {}).get("kind"), "checking"))
         else:
-            accounts.append(_line(aid, meta["display_name"], meta["kind"]))
+            line = _line(aid, meta["display_name"], meta["kind"])
+
+        if line is not None:
+            accounts.append(line)
+        else:
+            # Listed, not counted. Naming them is the honest alternative to either
+            # inventing a balance or pretending the account does not exist.
+            unlinked.append({"id": aid, "name": meta["display_name"], "kind": meta["kind"]})
 
     assets = 0
     liabilities = 0
@@ -232,31 +237,30 @@ async def _compute_current_balances(db):
                 liabilities += abs(a["balance"])
 
     return (accounts, assets, liabilities, estimated_property_value, mortgage_balance,
-            mortgage_by_month, first_mortgage_month)
+            mortgage_by_month, first_mortgage_month, unlinked)
 
 
-def _balance_confidence(accounts):
-    """Which lines in the total are real balances, and which are only estimates.
+def _balance_confidence(accounts, unlinked):
+    """What the total is built from, and what was deliberately left out of it.
 
-    Reported rather than silently mixed in. An unlinked account has no opening
-    balance anywhere in the database, so the best available number is the net of
-    the transactions that happen to have been imported — useful, but not a
-    balance, and a headline that blends the two without saying so is how this
-    page came to be confidently wrong.
+    Every line in the total is now a balance the bank reported, or the owner's
+    stated purchase price for the property. Unlinked accounts are NOT estimated
+    into the total: the database has no opening balance for them, so the only
+    honest options were to omit them or to invent a figure, and the owner asked
+    for the former in as many words.
     """
-    estimated = [a for a in accounts if a.get("balance_basis") == "flow_sum"]
     return {
         "lines_from_real_balances": sum(
             1 for a in accounts if a.get("balance_basis") == "plaid"),
-        "lines_estimated_from_flows": len(estimated),
-        "estimated_accounts": [a["id"] for a in estimated],
-        "estimated_net_cents": sum(a["balance"] for a in estimated),
+        "lines_estimated_from_flows": 0,
+        "excluded_unlinked_accounts": [a["name"] for a in unlinked],
         "note": (
-            "Linked accounts use the balance the bank reports. "
-            f"{len(estimated)} unlinked account(s) contribute the net of their "
-            "imported transactions instead, which is not a true balance — link "
-            "them for an exact figure."
-        ) if estimated else "Every balance in this total comes from the bank.",
+            "Every balance here is reported by the bank, plus the stated purchase "
+            "price of the property."
+            + (f" {len(unlinked)} account(s) not connected to Plaid are excluded "
+               "entirely — no balance for them exists in the data, so counting them "
+               "would mean inventing one." if unlinked else "")
+        ),
     }
 
 
@@ -265,7 +269,7 @@ async def get_net_worth():
     db = await get_db()
     try:
         (accounts, assets, liabilities, prop_val, mortgage_bal,
-         mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
+         mortgage_by_month, first_mortgage_month, unlinked) = await _compute_current_balances(db)
         total_net_worth = assets - liabilities
 
         history = await _compute_history(db, accounts,
@@ -277,7 +281,8 @@ async def get_net_worth():
             "assets": assets,
             "liabilities": liabilities,
             "total_net_worth_cents": total_net_worth,
-            "balance_confidence": _balance_confidence(accounts),
+            "balance_confidence": _balance_confidence(accounts, unlinked),
+            "unlinked_accounts": unlinked,
             "history": history,
         }
     finally:
@@ -292,7 +297,7 @@ async def get_net_worth_history(
     db = await get_db()
     try:
         (accounts, assets, liabilities, prop_val, mortgage_bal,
-         mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
+         mortgage_by_month, first_mortgage_month, unlinked) = await _compute_current_balances(db)
         history = await _compute_history(db, accounts,
                                         mortgage_by_month, first_mortgage_month)
 

@@ -15,10 +15,52 @@ DEMO_ACCOUNTS = {
 }
 
 
+# Net worth counts LINKED accounts only: an unlinked account has no balance
+# anywhere in the database, and the owner's instruction was to omit those rather
+# than estimate one from imported transactions ("you shouldn't be making up
+# things"). So the fixture has to link them, which is also what makes these tests
+# exercise the real path — a balance the bank reported.
+DEMO_PLAID_BALANCES = {
+    "bank-0001": ("depository", 250000),    # $2,500.00 asset
+    "card-0002": ("credit", 40000),         # $400.00 OWED -> -$400.00 here
+    "home-0003": ("depository", 100000),    # the residence's own cash
+}
+
+
 @pytest.fixture(autouse=True)
 def demo_accounts(test_client):
     resp = test_client.post("/api/accounts/meta", json={"accounts": DEMO_ACCOUNTS})
     assert resp.status_code == 200
+    _link_demo_accounts()
+
+
+def _link_demo_accounts():
+    """Give each demo account a Plaid row with a reported balance."""
+    import os
+    import sqlite3
+
+    con = sqlite3.connect(os.environ["DB_PATH"])
+    try:
+        con.execute(
+            """INSERT OR IGNORE INTO plaid_items (item_id, access_token_encrypted,
+                   institution_id, institution_name) VALUES ('demo-item','x','ins_demo','Demo')"""
+        )
+        item_id = con.execute(
+            "SELECT id FROM plaid_items WHERE item_id='demo-item'").fetchone()[0]
+        for aid, (ptype, cents) in DEMO_PLAID_BALANCES.items():
+            con.execute(
+                """INSERT INTO plaid_accounts (item_db_id, plaid_account_id, name, mask,
+                       type, canonical_account_id, include_in_sync, current_balance_cents)
+                   VALUES (?,?,?,?,?,?,1,?)
+                   ON CONFLICT(plaid_account_id) DO UPDATE SET
+                       current_balance_cents=excluded.current_balance_cents,
+                       type=excluded.type, canonical_account_id=excluded.canonical_account_id""",
+                (item_id, f"plaid-{aid}", DEMO_ACCOUNTS[aid]["display_name"],
+                 aid[-4:], ptype, aid, cents),
+            )
+        con.commit()
+    finally:
+        con.close()
 
 
 def test_net_worth_shape(test_client):
@@ -141,3 +183,54 @@ def test_display_name_is_editable(test_client):
 def test_rejects_unknown_kind(test_client):
     resp = test_client.patch("/api/accounts/bank-0001/meta", json={"kind": "crypto"})
     assert resp.status_code == 400
+
+
+def test_unlinked_accounts_are_excluded_not_estimated(test_client):
+    """An account with no bank-reported balance must not reach the total.
+
+    The database holds the net of whatever transactions were imported, which is
+    NOT a balance — on the owner's real data chase-3600 summed to -$315,523 while
+    the bank reported +$14,356.70, because the import starts mid-life and no
+    opening balance is stored anywhere. Estimating from flows therefore put a
+    six-figure fiction in the headline. The owner's instruction was explicit:
+    exclude accounts that are not connected, and do not invent figures for them.
+    """
+    before = test_client.get("/api/net-worth").json()
+    linked_ids = {a["id"] for a in before["accounts"]}
+    assert "bank-0001" in linked_ids
+
+    # Declare an account that exists in account_meta but has no Plaid link.
+    resp = test_client.post("/api/accounts/meta", json={"accounts": {
+        "ghost-0009": {"display_name": "Closed Cash App", "kind": "checking", "sort_order": 9},
+    }})
+    assert resp.status_code == 200
+
+    after = test_client.get("/api/net-worth").json()
+    ids = {a["id"] for a in after["accounts"]}
+    assert "ghost-0009" not in ids, "an unlinked account must not be counted"
+
+    # It is listed, though — omitted from the arithmetic is not the same as hidden.
+    assert any(u["id"] == "ghost-0009" for u in after["unlinked_accounts"])
+    assert "Closed Cash App" in after["balance_confidence"]["excluded_unlinked_accounts"]
+
+    # Nothing in the total is an estimate, and the total did not move.
+    assert after["balance_confidence"]["lines_estimated_from_flows"] == 0
+    assert all(a.get("balance_basis") in (None, "plaid") for a in after["accounts"])
+    assert after["total_net_worth_cents"] == before["total_net_worth_cents"]
+    assert after["assets"] - after["liabilities"] == after["total_net_worth_cents"]
+
+
+def test_history_ends_at_the_headline(test_client):
+    """The chart's last point must equal the number printed above it.
+
+    They were computed two different ways: the headline moved to bank-reported
+    balances while the history kept its own unscoped flow sums, and the two
+    disagreed by $211,071.90 on real data — a chart contradicting its own KPI.
+    """
+    data = test_client.get("/api/net-worth").json()
+    history = data["history"]
+    if not history:
+        pytest.skip("no transactions in this fixture, so there is no series to check")
+    assert history[-1]["value"] == data["total_net_worth_cents"]
+    assert history[-1]["assets"] == data["assets"]
+    assert history[-1]["liabilities"] == data["liabilities"]

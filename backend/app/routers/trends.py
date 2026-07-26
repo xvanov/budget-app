@@ -143,7 +143,7 @@ async def _net_worth_series(db, start_date, end_date):
     from app.routers.net_worth import _compute_current_balances, _compute_history
 
     (accounts, assets, liabilities, prop_val, mortgage_bal,
-     mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
+     mortgage_by_month, first_mortgage_month, _unlinked) = await _compute_current_balances(db)
     history = await _compute_history(db, accounts,
                                     mortgage_by_month, first_mortgage_month)
 

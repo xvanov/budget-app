@@ -784,11 +784,12 @@ function NetWorthSummary() {
         </div>
       </div>
 
-      {conf.lines_estimated_from_flows > 0 && (
+      {(conf.excluded_unlinked_accounts || []).length > 0 && (
         <div style={{padding:'0 14px 10px', fontSize:12, color:'var(--muted-foreground)'}}>
-          <Icon name="AlertTriangle" size={12}/>{' '}
-          {conf.note} They contribute{' '}
-          <span className="mono">{fmtCurrency(conf.estimated_net_cents)}</span>.
+          {conf.note}{' '}
+          <span title={conf.excluded_unlinked_accounts.join(', ')}>
+            Excluded: {conf.excluded_unlinked_accounts.join(', ')}.
+          </span>
         </div>
       )}
 
@@ -810,9 +811,9 @@ function NetWorthSummary() {
               </span>
             )}
             <span style={{fontSize:11, color:'var(--muted-foreground)'}}
-                  title={a.balance_note || (a.balance_basis === 'plaid' ? 'Balance reported by the bank' : '')}>
-              {a.balance_basis === 'flow_sum' ? 'estimated'
-                : a.balance_basis === 'plaid' ? 'from bank'
+                  title={a.balance_basis === 'plaid' ? 'Balance reported by the bank'
+                         : a.value_basis === 'stated' ? 'Purchase price, as you stated it' : ''}>
+              {a.balance_basis === 'plaid' ? 'from bank'
                 : a.value_basis === 'stated' ? 'stated' : ''}
             </span>
             <span className={'mono ' + (a.balance >= 0 ? 'amt-pos' : 'amt-neg')} style={{minWidth:96, textAlign:'right'}}>
@@ -3873,7 +3874,7 @@ function FlowPage({ flow, periodId }) {
                     return (
                     <tr key={r.label}
                         title={`Show the ${isIncome ? 'income' : 'expenses'} behind ${r.label}`}
-                        onClick={() => setDrill(isOpen ? null : { category: r.label, value: r.value })}
+                        onClick={() => setDrill(isOpen ? null : { category: r.label })}
                         style={{background: isOpen
                           ? 'color-mix(in oklab, var(--primary) 14%, transparent)'
                           : (hovered === r.label || (hoveredMembers || []).includes(r.label))
@@ -3898,8 +3899,15 @@ function FlowPage({ flow, periodId }) {
       )}
 
       {drill && (
+        // The expected total is READ FROM THE CURRENT rows, never remembered from
+        // the click. It used to be captured into `drill.value`; changing the period
+        // with a category open then refetched the rows for the new window while the
+        // expectation stayed on the old one, and the drill-down cried "that gap is
+        // a bug" about two figures from different months. `null` when the category
+        // has nothing in this period, which means "no expectation to check".
         <CategoryDrillDown category={drill.category} isIncome={isIncome} periodId={periodId}
-                           expectedCents={drill.value} onClose={() => setDrill(null)}/>
+                           expectedCents={rows.find(r => r.label === drill.category)?.value ?? null}
+                           onClose={() => setDrill(null)}/>
       )}
 
       <CategoryManager onChanged={() => setVersion(v => v + 1)}/>
@@ -5891,8 +5899,13 @@ function MerchantsPage({ periodId }) {
       )}
 
       {selected && (
+        // Same rule as the category drill-down: the expectation comes from the
+        // CURRENT ranking, not from what was on screen when the row was clicked.
+        // A vendor that exists in both windows with different spend would
+        // otherwise be checked against the previous window's figure.
         <MerchantDetailCard merchantKey={selected.key} label={selected.label} periodId={periodId}
-                            categories={cats} expectedCents={selected.spend}
+                            categories={cats}
+                            expectedCents={merchants.find(m => m.merchant_key === selected.key)?.spend_cents ?? null}
                             onClose={() => setSelected(null)}/>
       )}
 
