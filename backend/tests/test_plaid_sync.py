@@ -355,3 +355,84 @@ async def test_list_items_never_exposes_the_token(db):
     assert "access_token" not in blob
     assert "v1:" not in blob
     assert items[0]["has_cursor"] is False
+
+
+# ------------------------------------------------------- refund pairing on sync
+
+@pytest.mark.asyncio
+async def test_sync_pairs_a_refund_it_just_delivered(db, monkeypatch):
+    """A refund that arrives by sync must be PAIRED with its charge.
+
+    Before this, `refund_pairs.detect_and_store` ran only from
+    `POST /api/refunds/detect`. Category totals were right either way (a positive
+    amount nets against its own category), but the Refunded tab stayed empty and
+    the charge still read as money spent until somebody triggered detection by
+    hand. Observed live: the AMC credit of 2026-07-24 synced in unpaired.
+    """
+    item_db_id = await _seed_item(db)
+
+    charge = {
+        "transaction_id": "txn-charge-1", "account_id": "plaid-acct-1",
+        "date": "2026-07-22", "authorized_date": "2026-07-22",
+        "amount": 57.02,                      # Plaid positive = money out
+        "name": "AMC 9640 ONLINE", "merchant_name": "AMC Theatres",
+        "iso_currency_code": "USD", "pending": False,
+    }
+    refund = {
+        "transaction_id": "txn-refund-1", "account_id": "plaid-acct-1",
+        "date": "2026-07-24", "authorized_date": "2026-07-24",
+        "amount": -57.02,                     # Plaid negative = money in
+        "name": "AMC 9640 ONLINE", "merchant_name": "AMC Theatres",
+        "iso_currency_code": "USD", "pending": False,
+    }
+    client = StubClient([page(added=[charge, refund], next_cursor="cur-1")])
+
+    totals = await plaid_sync.sync_all(db, client=client, categorize=False)
+    assert totals["added"] == 2
+
+    # Both halves must carry the pairing, without anyone calling the endpoint.
+    cursor = await db.execute(
+        "SELECT external_id, amount_cents, refund_role, refund_match_id "
+        "FROM transactions WHERE external_id IN ('txn-charge-1','txn-refund-1') "
+        "ORDER BY amount_cents"
+    )
+    rows = [dict(r) for r in await cursor.fetchall()]
+    assert len(rows) == 2
+    by_id = {r["external_id"]: r for r in rows}
+    assert by_id["txn-charge-1"]["amount_cents"] == -5702
+    assert by_id["txn-refund-1"]["amount_cents"] == 5702
+    assert totals.get("refund_pairs") == 1, totals
+    assert by_id["txn-charge-1"]["refund_role"] is not None, \
+        "the charge was never marked as refunded"
+    assert by_id["txn-refund-1"]["refund_role"] is not None, \
+        "the credit was never linked back to its charge"
+    assert by_id["txn-charge-1"]["refund_match_id"] is not None
+    assert by_id["txn-refund-1"]["refund_match_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_an_idle_sync_does_not_re_mark_refunds(db, monkeypatch):
+    """Nothing changed, so detection must not run.
+
+    Detection is a wipe-and-re-mark across the whole scope. Running it on every
+    hourly tick would be pointless work on unchanged data, and any bug in it
+    would get 24 chances a day to corrupt the marks instead of one per real
+    change.
+    """
+    await _seed_item(db)
+    calls = []
+
+    async def _spy(db_, scope="plaid"):
+        calls.append(scope)
+        return {"pairs": 0}
+
+    import app.services.refund_pairs as rp
+
+    monkeypatch.setattr(rp, "detect_and_store", _spy)
+
+    totals = await plaid_sync.sync_all(
+        db, client=StubClient([page(added=[], next_cursor="cur-x")]), categorize=False
+    )
+    assert totals["added"] == 0 and totals["updated"] == 0 and totals["removed"] == 0
+    assert calls == [], "detection ran even though the sync changed nothing"
+    assert "refund_pairs" not in totals

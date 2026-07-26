@@ -86,12 +86,77 @@ async def _mortgage_position(db):
     return int(balance_cents or 0), property_value, by_month, first_month
 
 
+# Plaid's account `type` vocabulary mapped onto this app's `kind`. Leaking
+# Plaid's own words through would put "depository" on screen and break the kind
+# whitelist every consumer checks against.
+_APP_KIND = {
+    "depository": "checking",
+    "credit": "credit",
+    "investment": "brokerage",
+    "brokerage": "brokerage",
+    "loan": "credit",
+}
+
+
+async def _plaid_balances(db):
+    """The balances Plaid actually reports, per canonical account.
+
+    This is the only trustworthy balance in the database. Summing transaction
+    amounts does NOT give one: it gives the cumulative flow over whatever window
+    happens to be imported, which for these accounts is off by six figures
+    (chase-3600 sums to -$315,523 while Plaid reports +$14,356.70, because the
+    import starts mid-life and no opening balance is stored).
+
+    Sign convention of this module: positive is an asset, negative is money owed.
+    Plaid reports a card balance as a POSITIVE amount OWED, so credit accounts
+    are negated here — getting that backwards turns debt into savings.
+    """
+    balances = {}
+    try:
+        cursor = await db.execute(
+            """SELECT canonical_account_id AS aid, current_balance_cents AS cents,
+                      type AS ptype, name
+               FROM plaid_accounts
+               WHERE current_balance_cents IS NOT NULL AND include_in_sync = 1"""
+        )
+    except Exception as exc:  # table absent on a pre-Plaid database
+        logger.warning("Net worth: no Plaid balances available (%s)", exc)
+        return balances
+    for row in await cursor.fetchall():
+        cents = int(row["cents"] or 0)
+        if (row["ptype"] or "").strip().lower() == "credit":
+            cents = -abs(cents)
+        balances[row["aid"]] = {"cents": cents, "name": row["name"],
+                                "kind": (row["ptype"] or "").strip().lower()}
+    return balances
+
+
 async def _compute_account_balances(db):
+    """Cumulative flow per account, per scope.
+
+    Kept only as the fallback for accounts Plaid does not cover, and split by
+    scope because the CSV history and its Plaid twins are BOTH in this table:
+    an unscoped sum counts every twinned transaction twice. `live` is the
+    plaid+manual scope (see services/scope.py), `all` is everything.
+    """
     cursor = await db.execute(
-        "SELECT account_id, SUM(amount_cents) as balance FROM transactions GROUP BY account_id"
+        """SELECT account_id,
+                  SUM(amount_cents) AS all_cents,
+                  SUM(CASE WHEN source_platform IN ('plaid','manual')
+                           THEN amount_cents ELSE 0 END) AS live_cents,
+                  SUM(CASE WHEN source_platform IN ('plaid','manual')
+                           THEN 1 ELSE 0 END) AS live_rows
+           FROM transactions GROUP BY account_id"""
     )
-    rows = await cursor.fetchall()
-    return {r["account_id"]: r["balance"] for r in rows}
+    out = {}
+    for r in await cursor.fetchall():
+        # An account with live rows is deduped to those rows; one without them
+        # has only history, so its history is all there is.
+        out[r["account_id"]] = {
+            "cents": r["live_cents"] if r["live_rows"] else r["all_cents"],
+            "deduped": bool(r["live_rows"]),
+        }
+    return out
 
 
 async def _compute_current_balances(db):
@@ -105,26 +170,49 @@ async def _compute_current_balances(db):
     estimated_property_value = int(property_value or 0)
     property_basis = "stated" if property_value else "unknown"
 
+    plaid = await _plaid_balances(db)
+
+    def _line(aid, name, kind):
+        """One account line, with WHERE its balance came from stated on it.
+
+        Precedence is Plaid's reported balance, then a scope-deduped flow sum.
+        The basis travels with the number because the two are not comparable:
+        one is a balance, the other is only the net of the transactions we happen
+        to hold, and a total mixing them silently is how this page came to be
+        wrong by six figures.
+        """
+        entry = plaid.get(aid)
+        if entry is not None:
+            return {"id": aid, "name": name, "kind": kind,
+                    "balance": entry["cents"], "balance_basis": "plaid"}
+        flow = balances.get(aid) or {"cents": 0, "deduped": False}
+        return {"id": aid, "name": name, "kind": kind, "balance": flow["cents"],
+                "balance_basis": "flow_sum",
+                "balance_note": "Net of imported transactions, not a real balance — "
+                                "this account is not linked, so no opening balance is known."}
+
     accounts = []
     for meta in await _net_worth_accounts(db):
         aid = meta["account_id"]
-        bal = balances.get(aid, 0)
         if meta["kind"] == "real_estate":
+            # The house and the bank account are two different things. They were
+            # collapsed into one line, so the property value REPLACED the
+            # account's cash instead of being counted alongside it — the cash
+            # simply vanished from net worth.
             accounts.append({
-                "id": aid,
+                "id": f"{aid}::property",
                 "name": meta["display_name"],
                 "kind": "real_estate",
                 "balance": estimated_property_value,
                 "value_basis": property_basis,
                 "debt": mortgage_balance,
             })
+            entry = plaid.get(aid)
+            cash_name = (entry or {}).get("name") or f"Account {aid}"
+            accounts.append(_line(aid, cash_name, _APP_KIND.get(
+                (entry or {}).get("kind"), "checking")))
         else:
-            accounts.append({
-                "id": aid,
-                "name": meta["display_name"],
-                "kind": meta["kind"],
-                "balance": bal,
-            })
+            accounts.append(_line(aid, meta["display_name"], meta["kind"]))
 
     assets = 0
     liabilities = 0
@@ -147,6 +235,31 @@ async def _compute_current_balances(db):
             mortgage_by_month, first_mortgage_month)
 
 
+def _balance_confidence(accounts):
+    """Which lines in the total are real balances, and which are only estimates.
+
+    Reported rather than silently mixed in. An unlinked account has no opening
+    balance anywhere in the database, so the best available number is the net of
+    the transactions that happen to have been imported — useful, but not a
+    balance, and a headline that blends the two without saying so is how this
+    page came to be confidently wrong.
+    """
+    estimated = [a for a in accounts if a.get("balance_basis") == "flow_sum"]
+    return {
+        "lines_from_real_balances": sum(
+            1 for a in accounts if a.get("balance_basis") == "plaid"),
+        "lines_estimated_from_flows": len(estimated),
+        "estimated_accounts": [a["id"] for a in estimated],
+        "estimated_net_cents": sum(a["balance"] for a in estimated),
+        "note": (
+            "Linked accounts use the balance the bank reports. "
+            f"{len(estimated)} unlinked account(s) contribute the net of their "
+            "imported transactions instead, which is not a true balance — link "
+            "them for an exact figure."
+        ) if estimated else "Every balance in this total comes from the bank.",
+    }
+
+
 @router.get("/api/net-worth")
 async def get_net_worth():
     db = await get_db()
@@ -164,6 +277,7 @@ async def get_net_worth():
             "assets": assets,
             "liabilities": liabilities,
             "total_net_worth_cents": total_net_worth,
+            "balance_confidence": _balance_confidence(accounts),
             "history": history,
         }
     finally:

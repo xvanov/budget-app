@@ -105,8 +105,16 @@ def test_kind_from_account_meta_drives_arithmetic(test_client):
     estimated property value off the asset side.
     """
     before = test_client.get("/api/net-worth").json()
-    assert [a["kind"] for a in before["accounts"] if a["id"] == "home-0003"] == ["real_estate"]
-    assert [a["name"] for a in before["accounts"] if a["id"] == "home-0003"] == ["Residence"]
+    # A `real_estate` account now emits TWO lines: the property itself, under
+    # `<id>::property`, and the bank account's own cash under the plain id. They
+    # used to be collapsed into one, which meant the property value REPLACED the
+    # cash rather than being counted beside it — the cash disappeared from net
+    # worth entirely.
+    prop = [a for a in before["accounts"] if a["id"] == "home-0003::property"]
+    assert [a["kind"] for a in prop] == ["real_estate"]
+    assert [a["name"] for a in prop] == ["Residence"]
+    cash = [a for a in before["accounts"] if a["id"] == "home-0003"]
+    assert len(cash) == 1 and cash[0]["kind"] != "real_estate"
 
     resp = test_client.patch("/api/accounts/home-0003/meta", json={"kind": "checking"})
     assert resp.status_code == 200
@@ -114,6 +122,8 @@ def test_kind_from_account_meta_drives_arithmetic(test_client):
 
     after = test_client.get("/api/net-worth").json()
     assert all(a["kind"] != "real_estate" for a in after["accounts"])
+    # Reclassifying drops the property line, so the property value leaves assets.
+    assert not any(a["id"].endswith("::property") for a in after["accounts"])
     assert after["assets"] < before["assets"]
     assert after["assets"] - after["liabilities"] == after["total_net_worth_cents"]
 

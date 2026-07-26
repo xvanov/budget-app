@@ -345,4 +345,29 @@ async def sync_all(db, client=None, categorize: bool = True) -> Dict[str, Any]:
             logger.warning("Post-sync categorization failed: %s", exc)
             totals["errors"].append({"stage": "categorize", "error": str(exc)[:200]})
 
+    # Refund pairing. Without this a refund Plaid delivers is a standalone credit
+    # until somebody remembers to POST /api/refunds/detect: category totals are
+    # right either way (a positive amount nets against its own category), but the
+    # Refunded tab shows nothing and the charge still reads as money spent.
+    # Observed live: the AMC credit of 2026-07-24 synced in unpaired.
+    #
+    # Detection re-derives every pair inside the scope rather than only the new
+    # rows — it is a full re-mark by design, so that a pair whose halves arrive in
+    # different syncs still gets matched. It is deterministic and involves no LLM.
+    # Only run when this sync actually changed something, so an idle hourly tick
+    # is a no-op.
+    if (totals["added"] or totals["updated"] or totals["removed"]):
+        from app.services.refund_pairs import detect_and_store
+
+        try:
+            result = await detect_and_store(db)
+            # NB `detect_and_store` reports "pairs" as a COUNT. Its neighbour
+            # `list_pairs` uses the same key for the full list of pair objects and
+            # puts the count under "count" — so reading "count" here silently
+            # yields 0 forever.
+            totals["refund_pairs"] = int(result.get("pairs") or 0)
+        except Exception as exc:
+            logger.warning("Post-sync refund detection failed: %s", exc)
+            totals["errors"].append({"stage": "refund_pairs", "error": str(exc)[:200]})
+
     return totals
