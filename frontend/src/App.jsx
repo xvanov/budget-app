@@ -4631,259 +4631,574 @@ function ActivityPage() {
 }
 
 // ───── Mortgage Page ─────
-function MortgagePage({ periodId }) {
-  const [data, setData] = useState(null)
-  const [components, setComponents] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [scheduleSort, setScheduleSort] = useState('month')
-  const [scheduleDir, setScheduleDir] = useState('asc')
+// Rewritten to read GET /api/mortgage, which reports the loan from the ledger.
+// What was here before rendered the `amortization` table — a forward projection
+// the lender issued in 2026 — as if it were history, so a loan that was taken out
+// in February 2025 and paid off in July 2026 appeared to start in mid-2026, run
+// to 2031 and still owe $153,538. Every figure now carries a basis (measured /
+// derived / stated / inferred / unknown) and nothing on the page is invented:
+// where a fact is not known the tab says so and offers to record it.
 
-  function handleScheduleSort(col) {
-    if (scheduleSort === col) {
-      setScheduleDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setScheduleSort(col)
-      setScheduleDir('asc')
-    }
-  }
+const BASIS_CHIP = {
+  measured: { cls: 'is-good', label: 'measured' },
+  derived: { cls: 'is-plain', label: 'derived' },
+  stated: { cls: 'is-plain', label: 'stated by you' },
+  inferred: { cls: 'is-warn', label: 'inferred' },
+  // The transaction is real; what it was FOR is the owner's recollection.
+  believed: { cls: 'is-warn', label: 'believed' },
+  unknown: { cls: 'is-warn', label: 'not known' },
+}
 
-  function sortIcon(col) {
-    if (scheduleSort !== col) return ''
-    return scheduleDir === 'asc' ? ' ▲' : ' ▼'
-  }
+function BasisChip({ basis }) {
+  const b = BASIS_CHIP[basis] || BASIS_CHIP.unknown
+  return <span className={`chip is-plain ${b.cls}`} style={{height:20, fontSize:10.5, padding:'0 8px'}}>{b.label}</span>
+}
 
-  useEffect(() => {
-    setLoading(true)
-    Promise.all([
-      apiFetch('/amortization'),
-      apiFetch('/mortgage/components'),
-    ]).then(([amort, comps]) => {
-      setData(amort)
-      setComponents(Array.isArray(comps) ? comps : [])
-      setLoading(false)
-    }).catch(() => setLoading(false))
-  }, [])
-
-  if (loading) {
-    return (
-      <div className="page">
-        <div className="subtitle">Loading mortgage data...</div>
-      </div>
-    )
-  }
-
-  const summary = data?.summary || {}
-  const schedule = data?.schedule || []
-  const notes = data?.notes || []
-  const actualByMonth = data?.actual_by_month || []
-
-  const sortedSchedule = [...schedule].sort((a, b) => {
-    const dir = scheduleDir === 'asc' ? 1 : -1
-    const aVal = a[scheduleSort]
-    const bVal = b[scheduleSort]
-    if (typeof aVal === 'string') return aVal.localeCompare(bVal) * dir
-    return (aVal - bVal) * dir
-  })
-
-  const totalMortgageTxn = components.reduce((s, t) => s + Math.abs(t.amount_cents || 0), 0)
-  const totalAmortization = summary.total_principal_paid_cents + summary.total_interest_paid_cents
-
+// A KPI whose subtitle IS its provenance. Unknown figures render as an em dash,
+// never as $0 — a paid-off escrow refund we have not seen is not zero dollars.
+function FigureCard({ label, figure, color, children }) {
+  const known = figure && figure.cents != null
   return (
-    <div className="page">
-      <div className="page-intro">
-        <div className="subtitle">Amortization schedule and payment breakdown</div>
+    <div className="card kpi">
+      <div className="kpi-label">{label}</div>
+      <div className="kpi-value" style={{color: known ? color : 'var(--muted-foreground)'}}>
+        {known ? fmtCurrency(figure.cents, {full: true, decimals: 2}) : '—'}
       </div>
-
-      <div className="kpi-grid" style={{gridTemplateColumns:'repeat(4, 1fr)'}}>
-        <KpiCard label="Balance now"
-                 value={summary.current_balance_cents == null ? '—' : fmtCurrency(summary.current_balance_cents)}
-                 sub={summary.anchor_month
-                   ? <span>from {fmtCurrency(summary.anchor_balance_cents)} at {summary.anchor_month}</span>
-                   : <span>no lender schedule imported</span>}
-                 color="#a78bfa"/>
-        <KpiCard label="Principal paid since"
-                 value={fmtCurrency(summary.principal_paid_since_anchor_cents)}
-                 sub={<span>{summary.payments_since_anchor} payment{summary.payments_since_anchor === 1 ? '' : 's'} since {summary.anchor_month}</span>}
-                 color="#4ade80"/>
-        <KpiCard label="Interest paid since"
-                 value={fmtCurrency(summary.interest_paid_since_anchor_cents)}
-                 sub={<span>per the lender schedule split</span>}
-                 color="#f43f5e"/>
-        <KpiCard label="All payments recorded"
-                 value={fmtCurrency(summary.total_principal_paid_cents)}
-                 sub={<span>{summary.total_principal_payment_count} payments · {summary.scope} data</span>}
-                 color="#22c55e"/>
+      <div className="kpi-delta" style={{flexWrap:'wrap', gap:6}}>
+        <BasisChip basis={figure?.basis}/>
+        {children}
       </div>
-
-      {(notes.length > 0) && (
-        <div className="card" style={{padding:14}}>
-          <div className="h" style={{marginBottom:6}}>How these numbers are derived</div>
-          <ul style={{margin:0, paddingLeft:18, fontSize:12.5, color:'var(--muted-foreground)', lineHeight:1.6}}>
-            {notes.map((n, i) => <li key={i}>{n}</li>)}
-          </ul>
-        </div>
-      )}
-
-      {actualByMonth.length > 0 && (
-        <div className="card">
-          <div className="section-head">
-            <div>
-              <div className="h">Actual payments by month</div>
-              <div className="sub">Straight from the ledger — this is what was really paid</div>
-            </div>
-          </div>
-          <div style={{overflow:'auto', maxHeight:300}}>
-            <table className="tbl">
-              <thead><tr>
-                <th>Month</th><th className="text-right">Paid</th><th className="text-right">Payments</th>
-              </tr></thead>
-              <tbody>
-                {actualByMonth.slice().reverse().map(m => (
-                  <tr key={m.month}>
-                    <td className="mono" style={{fontSize:12}}>{m.month}</td>
-                    <td className="text-right mono">{fmtCurrency(-m.principal_cents)}</td>
-                    <td className="text-right mono">{m.payment_count}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Lender schedule (projection)</div>
-            <div className="sub">
-              {schedule.length} scheduled months from {schedule[0]?.month || '—'} — a forward
-              projection from the lender, not a record of what was paid
-            </div>
-          </div>
-        </div>
-        <div style={{overflow:'auto', maxHeight:400}}>
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th style={{cursor:'pointer', userSelect:'none'}} onClick={() => handleScheduleSort('month')}>Month{sortIcon('month')}</th>
-                <th className="text-right" style={{cursor:'pointer', userSelect:'none'}} onClick={() => handleScheduleSort('principal_cents')}>Principal{sortIcon('principal_cents')}</th>
-                <th className="text-right" style={{cursor:'pointer', userSelect:'none'}} onClick={() => handleScheduleSort('interest_cents')}>Interest{sortIcon('interest_cents')}</th>
-                <th className="text-right" style={{cursor:'pointer', userSelect:'none'}} onClick={() => handleScheduleSort('ending_balance_cents')}>Balance{sortIcon('ending_balance_cents')}</th>
-
-              </tr>
-            </thead>
-            <tbody>
-              {sortedSchedule.map(r => (
-                <tr key={r.id || r.month}>
-                  <td className="mono" style={{fontSize:12}}>{r.month}</td>
-                  <td className="text-right mono">{fmtCurrency(r.principal_cents)}</td>
-                  <td className="text-right mono">{fmtCurrency(r.interest_cents)}</td>
-                  <td className="text-right mono">{fmtCurrency(r.ending_balance_cents)}</td>
-
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Payments to Date</div>
-            <div className="sub">{components.length} mortgage-related transactions</div>
-          </div>
-        </div>
-        <div style={{overflow:'auto', maxHeight:400}}>
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Merchant</th>
-                <th>Category</th>
-                <th className="text-right">Amount</th>
-              </tr>
-            </thead>
-            <tbody>
-              {components.map(t => (
-                <tr key={t.id}>
-                  <td className="mono" style={{fontSize:12}}>{t.posted_date}</td>
-                  <td style={{fontWeight:500}}>{t.merchant}</td>
-                  <td><span className="cell-cat">{t.category_path}</span></td>
-                  <td className={`text-right mono ${t.amount_cents >= 0 ? 'amt-pos' : 'amt-neg'}`}>{fmtCurrency(t.amount_cents)}</td>
-                </tr>
-              ))}
-              {components.length === 0 && (
-                <tr><td colSpan={4} style={{textAlign:'center', padding:24, color:'var(--muted-foreground)'}}>No mortgage payment components found</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Principal vs Interest Over Time</div>
-            <div className="sub">Each month's principal and interest payments</div>
-          </div>
-        </div>
-        <div style={{padding:'12px 20px 20px'}}>
-          <MortgageChart schedule={schedule} />
-        </div>
-      </div>
-
-      {totalAmortization > 0 && (
-        <div className="card" style={{padding:'12px 20px', fontSize:13, color:'var(--muted-foreground)'}}>
-          <strong>Cross-check:</strong> Total in mortgage transactions (~{fmtCurrency(totalMortgageTxn)}) vs amortization total principal + interest ({fmtCurrency(totalAmortization)}) — difference: {fmtCurrency(Math.abs(totalMortgageTxn - totalAmortization))}
+      {figure?.note && (
+        <div style={{fontSize:11.5, color:'var(--muted-foreground)', marginTop:6, lineHeight:1.45}}>
+          {figure.note}
         </div>
       )}
     </div>
   )
 }
 
-function MortgageChart({ schedule }) {
+function MortgagePage() {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState(null)
+  const [showProjection, setShowProjection] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [form, setForm] = useState({})
+
+  const load = useCallback(() => {
+    setLoading(true)
+    return apiFetch('/mortgage')
+      .then(d => { setData(d); setErr(null) })
+      .catch(e => setErr(e.message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  function openEditor() {
+    const f = data?.facts || {}
+    setForm({
+      original_principal_cents: f.original_principal_cents ?? '',
+      annual_rate_bps: f.annual_rate_bps ?? '',
+      term_months: f.term_months ?? '',
+      first_payment_date: f.first_payment_date ?? '',
+      escrow_refund_cents: f.escrow_refund_cents ?? '',
+      escrow_refund_date: f.escrow_refund_date ?? '',
+    })
+    setEditing(true)
+  }
+
+  async function saveFacts(e) {
+    e.preventDefault()
+    setSaving(true)
+    const body = {}
+    for (const [k, v] of Object.entries(form)) {
+      body[k] = v === '' ? null : (k.endsWith('_cents') || k.endsWith('_bps') || k.endsWith('_months') ? Number(v) : v)
+    }
+    try {
+      await apiFetch('/mortgage/facts', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      setEditing(false)
+      await load()
+    } catch (e2) {
+      setErr(e2.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading && !data) {
+    return <div className="page"><div className="subtitle">Loading the loan…</div></div>
+  }
+  if (err && !data) {
+    return <div className="page"><div className="subtitle">Could not load the mortgage: {err}</div></div>
+  }
+
+  const f = data.figures || {}
+  const terms = data.terms || {}
+  const timeline = data.timeline || []
+  const checks = data.checks || []
+  const closed = data.status === 'closed'
+  const escrowKnown = f.escrow_refunded?.cents != null
+
+  return (
+    <div className="page">
+      <div className="page-intro">
+        <div className="subtitle">
+          {closed
+            ? <>Paid off on <strong>{data.payoff_date}</strong>{terms.scheduled_payoff_date
+                ? <> — {data.months_saved} months ahead of the original {terms.scheduled_payoff_date} payoff</>
+                : null}. Every figure below is labelled with where it came from.</>
+            : <>Loan position from the transactions on record. Every figure is labelled with where it came from.</>}
+        </div>
+        <div className="page-intro-actions">
+          {closed && <span className="chip is-plain is-good"><Icon name="Check" size={12}/> Paid off</span>}
+          <button className="btn btn--outline btn--sm" onClick={openEditor}>
+            <Icon name="Settings" size={13}/> Loan facts
+          </button>
+        </div>
+      </div>
+
+      {err && <div className="card" style={{padding:14, color:'var(--destructive)'}}>{err}</div>}
+
+      <div className="kpi-grid">
+        <FigureCard label="Amount borrowed" figure={f.original_loan} color="#a78bfa"/>
+        <FigureCard label="Total paid to lender" figure={f.total_paid_to_lender} color="var(--foreground)"/>
+        <FigureCard label="Principal repaid" figure={f.principal_paid} color="#4ade80"/>
+        <FigureCard label="Interest paid" figure={f.interest_paid} color="#f43f5e"/>
+      </div>
+
+      <div className="kpi-grid">
+        <FigureCard label="Escrow paid in" figure={f.escrow_paid} color="#38bdf8"/>
+        <FigureCard label="Escrow refunded" figure={f.escrow_refunded} color="#38bdf8">
+          {!escrowKnown && (
+            <button className="btn btn--outline btn--xs" onClick={openEditor}>Record it</button>
+          )}
+        </FigureCard>
+        <FigureCard label="Balance now" figure={f.final_balance} color={closed ? '#4ade80' : '#facc15'}/>
+        <FigureCard label="Interest saved" figure={f.interest_saved_vs_plan} color="#4ade80"/>
+      </div>
+
+      {/* Why the loan closed early — the single most interesting fact about it. */}
+      <div className="card">
+        <div className="section-head">
+          <div>
+            <div className="h">How it was paid off early</div>
+            <div className="sub">
+              Scheduled payments against extra principal. Curtailments go 100% to principal,
+              which is what pulled the payoff forward.
+            </div>
+          </div>
+        </div>
+        <div className="card-body" style={{display:'grid', gap:12, gridTemplateColumns:'repeat(auto-fit, minmax(220px, 1fr))'}}>
+          {[
+            ['Scheduled monthly payments', f.scheduled_payments_paid],
+            ['Extra principal (curtailments)', f.extra_principal_paid],
+            ['Interest the original plan would have charged', f.plan_interest_total],
+          ].map(([label, fig]) => (
+            <div key={label}>
+              <div className="kpi-label" style={{fontSize:11}}>{label}</div>
+              <div className="mono" style={{fontSize:20, fontWeight:600, marginTop:4}}>
+                {fig?.cents != null ? fmtCurrency(fig.cents, {full: true, decimals: 2}) : '—'}
+              </div>
+              <div style={{marginTop:4}}><BasisChip basis={fig?.basis}/></div>
+              {fig?.note && <div style={{fontSize:11.5, color:'var(--muted-foreground)', marginTop:4}}>{fig.note}</div>}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="section-head">
+          <div>
+            <div className="h">Balance: what happened vs the original plan</div>
+            <div className="sub">
+              Solid line is the real balance after every payment on record. Dashed line is the
+              loan as written ({terms.term_months || '—'} payments of{' '}
+              {terms.scheduled_pi_cents != null ? fmtCurrency(terms.scheduled_pi_cents, {full:true, decimals:2}) : '—'} P&amp;I
+              at {terms.annual_rate_pct != null ? terms.annual_rate_pct + '%' : '—'}) — the plan, not a forecast of anything still to come.
+            </div>
+          </div>
+        </div>
+        <div className="card-body">
+          <MortgageBalanceChart timeline={timeline} plan={data.plan_schedule || []}
+                                startCents={f.original_loan?.cents}
+                                startDate={data.facts?.first_payment_date || data.first_payment_date}/>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="section-head">
+          <div>
+            <div className="h">Every payment to the servicer</div>
+            <div className="sub">
+              {timeline.length} payments, {data.scope} scope. The principal / interest / escrow
+              columns are derived by running the amortization over these exact dates — they are
+              not stored on the transactions.
+            </div>
+          </div>
+        </div>
+        <div style={{overflow:'auto', maxHeight:460}}>
+          <table className="tbl">
+            <thead><tr>
+              <th>Date</th><th>Type</th><th className="text-right">Paid</th>
+              <th className="text-right">Principal</th><th className="text-right">Interest</th>
+              <th className="text-right">Escrow</th><th className="text-right">Balance after</th>
+            </tr></thead>
+            <tbody>
+              {timeline.map(t => (
+                <tr key={t.id}>
+                  <td className="mono" style={{fontSize:12}}>{t.posted_date}</td>
+                  <td>
+                    <span className={`chip is-plain ${t.kind === 'extra' ? 'is-good' : ''}`}
+                          style={{height:20, fontSize:10.5, padding:'0 8px'}}>
+                      {t.kind === 'extra' ? 'extra principal' : 'monthly'}
+                    </span>
+                  </td>
+                  <td className="text-right mono">{fmtCurrency(t.amount_cents, {full:true, decimals:2})}</td>
+                  <td className="text-right mono">{t.principal_cents == null ? '—' : fmtCurrency(t.principal_cents, {full:true, decimals:2})}</td>
+                  <td className="text-right mono">{t.interest_cents == null ? '—' : fmtCurrency(t.interest_cents, {full:true, decimals:2})}</td>
+                  <td className="text-right mono">{t.escrow_cents == null ? '—' : fmtCurrency(t.escrow_cents, {full:true, decimals:2})}</td>
+                  <td className="text-right mono">{t.balance_after_cents == null ? '—' : fmtCurrency(t.balance_after_cents, {full:true, decimals:2})}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {checks.length > 0 && (
+        <div className="card">
+          <div className="section-head">
+            <div>
+              <div className="h">Cross-checks</div>
+              <div className="sub">
+                Numbers that had no reason to agree unless this reconstruction of the loan is right.
+              </div>
+            </div>
+          </div>
+          <table className="tbl">
+            <tbody>
+              {checks.map(c => (
+                <tr key={c.name}>
+                  <td style={{width:26}}>
+                    <span style={{color: c.agrees ? '#4ade80' : 'var(--destructive)'}}>
+                      <Icon name={c.agrees ? 'Check' : 'AlertTriangle'} size={14}/>
+                    </span>
+                  </td>
+                  <td style={{fontWeight:500}}>{c.name}</td>
+                  <td style={{fontSize:12, color:'var(--muted-foreground)'}}>
+                    {c.left_label}: <span className="mono">{c.unit === 'percent' ? c.left + '%' : fmtCurrency(c.left, {full:true, decimals:2})}</span>
+                    {' · '}
+                    {c.right_label}: <span className="mono">{c.unit === 'percent' ? c.right + '%' : fmtCurrency(c.right, {full:true, decimals:2})}</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {(data.related || []).length > 0 && (
+        <div className="card">
+          <div className="section-head">
+            <div>
+              <div className="h">At the closing table</div>
+              <div className="sub">
+                Related to buying the house, but NOT part of the loan — none of it is in the
+                totals above.
+              </div>
+            </div>
+          </div>
+          <table className="tbl">
+            <tbody>
+              {data.related.map(r => (
+                <tr key={r.id}>
+                  <td className="mono" style={{fontSize:12, width:110, whiteSpace:'nowrap'}}>{r.posted_date}</td>
+                  <td className="text-right mono" style={{width:140}}>{fmtCurrency(r.amount_cents, {full:true, decimals:2})}</td>
+                  <td>
+                    <div>{r.label}</div>
+                    <div style={{fontSize:11.5, color:'var(--muted-foreground)', marginTop:2}}>
+                      {(r.description || '').slice(0, 70)}
+                      {r.implied_closing_costs_cents != null && f.down_payment?.cents != null && (
+                        <> — {fmtCurrency(f.down_payment.cents, {full:true, decimals:2})} down plus{' '}
+                        {fmtCurrency(r.implied_closing_costs_cents, {full:true, decimals:2})} that would be closing costs</>
+                      )}
+                    </div>
+                  </td>
+                  <td style={{width:110}}><BasisChip basis={r.confidence || 'believed'}/></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="section-head">
+          <div>
+            <div className="h">Loan terms</div>
+            <div className="sub">Terms come from the closing documents, so they are recorded, not guessed.</div>
+          </div>
+          <button className="btn btn--outline btn--sm" onClick={openEditor}>Edit</button>
+        </div>
+        <table className="tbl">
+          <tbody>
+            {[
+              ['Amount borrowed', f.original_loan?.cents != null ? fmtCurrency(f.original_loan.cents, {full:true, decimals:2}) : '—', f.original_loan?.basis],
+              ['Rate', terms.annual_rate_pct != null ? terms.annual_rate_pct + '% a year' : '—', terms.annual_rate_basis],
+              ['Term', terms.term_months ? terms.term_months + ' months' : '—', terms.term_months_basis],
+              ['Scheduled P&I', terms.scheduled_pi_cents != null ? fmtCurrency(terms.scheduled_pi_cents, {full:true, decimals:2}) + ' a month' : '—', terms.scheduled_pi_basis],
+              ['First payment', data.facts?.first_payment_date || data.first_payment_date || '—', data.facts?.first_payment_date ? 'stated' : data.first_payment_basis],
+              ['Original payoff date', terms.scheduled_payoff_date || '—', terms.scheduled_payoff_date_basis],
+              ['Actual payoff date', data.payoff_date || '—', data.payoff_date_basis],
+              ['Purchase price', f.purchase_price?.cents != null ? fmtCurrency(f.purchase_price.cents, {full:true, decimals:2}) : '—', f.purchase_price?.basis],
+              ['Down payment', f.down_payment?.cents != null ? fmtCurrency(f.down_payment.cents, {full:true, decimals:2}) : '—', f.down_payment?.basis],
+            ].map(([label, value, basis]) => (
+              <tr key={label}>
+                <td style={{width:200, color:'var(--muted-foreground)'}}>{label}</td>
+                <td className="mono">{value}</td>
+                <td style={{width:120}}><BasisChip basis={basis}/></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {(data.notes || []).length > 0 && (
+        <div className="card" style={{padding:14}}>
+          <div className="h" style={{marginBottom:6}}>How these numbers are derived</div>
+          <ul style={{margin:0, paddingLeft:18, fontSize:12.5, color:'var(--muted-foreground)', lineHeight:1.6}}>
+            {data.notes.map((n, i) => <li key={i}>{n}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {(data.warnings || []).length > 0 && (
+        <div className="card" style={{padding:14}}>
+          <div className="h" style={{marginBottom:6}}><Icon name="AlertTriangle" size={13}/> Worth knowing</div>
+          <ul style={{margin:0, paddingLeft:18, fontSize:12.5, color:'#facc15', lineHeight:1.6}}>
+            {data.warnings.map((n, i) => <li key={i}>{n}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {/* The lender's projection, kept only as the superseded document it is. */}
+      <div className="card">
+        <div className="section-head">
+          <div>
+            <div className="h">Lender's forward projection ({(data.lender_projection || []).length} months)</div>
+            <div className="sub">
+              Superseded. This is the schedule the servicer issued
+              {data.lender_projection?.[0] ? ` from ${data.lender_projection[0].month.slice(0, 7)}` : ''} —
+              a projection of payments that were never made, because the loan was paid off
+              {closed ? ` on ${data.payoff_date}` : ''}. Shown for reference only; nothing above uses it as history.
+            </div>
+          </div>
+          <button className="btn btn--ghost btn--sm" onClick={() => setShowProjection(s => !s)}>
+            {showProjection ? 'Hide' : 'Show'}
+          </button>
+        </div>
+        {showProjection && (
+          <div style={{overflow:'auto', maxHeight:360}}>
+            <table className="tbl">
+              <thead><tr>
+                <th>Month</th><th className="text-right">Principal</th>
+                <th className="text-right">Interest</th><th className="text-right">Balance</th>
+              </tr></thead>
+              <tbody>
+                {(data.lender_projection || []).map(r => (
+                  <tr key={r.id || r.month}>
+                    <td className="mono" style={{fontSize:12}}>{r.month}</td>
+                    <td className="text-right mono">{fmtCurrency(r.principal_cents, {full:true, decimals:2})}</td>
+                    <td className="text-right mono">{fmtCurrency(r.interest_cents, {full:true, decimals:2})}</td>
+                    <td className="text-right mono">{fmtCurrency(r.ending_balance_cents, {full:true, decimals:2})}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {editing && (
+        <div className="modal-overlay" onClick={() => setEditing(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title">Loan facts</div>
+              <button className="btn btn--ghost btn--sm" onClick={() => setEditing(false)}><Icon name="X" size={14}/></button>
+            </div>
+            <form onSubmit={saveFacts}>
+              <div className="modal-body">
+                <p style={{fontSize:12, color:'var(--muted-foreground)', marginTop:0}}>
+                  These come off the closing documents and the payoff letter — nothing in a bank
+                  export carries them. Anything you set here is reported as “stated by you” and
+                  overrides what the app worked out. Clear a field to hand it back to the derivation.
+                </p>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Amount borrowed (cents)</label>
+                    <input className="form-input" type="number" value={form.original_principal_cents}
+                           onChange={e => setForm(s => ({...s, original_principal_cents: e.target.value}))}
+                           placeholder="e.g. 28000000 for $280,000"/>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Rate (basis points)</label>
+                    <input className="form-input" type="number" value={form.annual_rate_bps}
+                           onChange={e => setForm(s => ({...s, annual_rate_bps: e.target.value}))}
+                           placeholder="e.g. 649 for 6.49%"/>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Term (months)</label>
+                    <input className="form-input" type="number" value={form.term_months}
+                           onChange={e => setForm(s => ({...s, term_months: e.target.value}))} placeholder="120"/>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">First payment date</label>
+                    <input className="form-input" type="date" value={form.first_payment_date}
+                           onChange={e => setForm(s => ({...s, first_payment_date: e.target.value}))}/>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Escrow refunded (cents)</label>
+                    <input className="form-input" type="number" value={form.escrow_refund_cents}
+                           onChange={e => setForm(s => ({...s, escrow_refund_cents: e.target.value}))}
+                           placeholder="e.g. 160000 for $1,600"/>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Escrow refund date</label>
+                    <input className="form-input" type="date" value={form.escrow_refund_date}
+                           onChange={e => setForm(s => ({...s, escrow_refund_date: e.target.value}))}/>
+                  </div>
+                </div>
+                <p style={{fontSize:12, color:'var(--muted-foreground)', marginBottom:0}}>
+                  The escrow refund is not in the ledger. Recording it here keeps it labelled as
+                  your figure; if the deposit later syncs from the bank, the measured credit wins.
+                </p>
+              </div>
+              <div className="modal-foot">
+                <button type="button" className="btn btn--outline" onClick={() => setEditing(false)}>Cancel</button>
+                <button type="submit" className="btn btn--primary" disabled={saving}>
+                  {saving ? 'Saving…' : 'Save facts'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Real balance after every payment, against the loan as originally written. Two
+// series on one time axis (x is the date, not the row index — the curtailments
+// are days apart, and evenly spacing them would misrepresent how fast the
+// balance actually fell).
+function MortgageBalanceChart({ timeline, plan, startCents, startDate }) {
   const ref = useRef(null)
   const [w, setW] = useState(800)
+  const [hov, setHov] = useState(null)
   useEffect(() => {
     if (!ref.current) return
     const ro = new ResizeObserver(es => { for (const e of es) setW(e.contentRect.width) })
     ro.observe(ref.current)
     return () => ro.disconnect()
   }, [])
-  const height = 240
-  const pad = { l: 56, r: 16, t: 12, b: 28 }
-  const innerW = w - pad.l - pad.r
+
+  const height = 260
+  const pad = { l: 60, r: 16, t: 12, b: 30 }
+  const innerW = Math.max(w - pad.l - pad.r, 10)
   const innerH = height - pad.t - pad.b
-  const maxV = Math.max(...schedule.flatMap(s => [s.principal_cents, s.interest_cents]), 1)
+
+  // Both series open at the amount borrowed, so the drop from it is visible
+  // rather than implied by an axis that starts below it.
+  const origin = (startCents != null && startDate)
+    ? [{ t: new Date(startDate + 'T00:00:00').getTime(), v: startCents, label: startDate, kind: 'origination' }]
+    : []
+  const actual = origin.concat(timeline
+    .filter(t => t.balance_after_cents != null)
+    .map(t => ({ t: new Date(t.posted_date + 'T00:00:00').getTime(), v: t.balance_after_cents, label: t.posted_date, kind: t.kind })))
+  const planPts = origin.concat((plan || [])
+    .filter(p => p.date)
+    .map(p => ({ t: new Date(p.date + 'T00:00:00').getTime(), v: p.ending_balance_cents, label: p.date })))
+
+  if (!actual.length) {
+    return <div className="subtitle">No payments to the servicer in this scope, so there is no balance curve to draw.</div>
+  }
+
+  // The plan runs years past the payoff. Showing all of it would squash the part
+  // that actually happened, so the x axis stops a year after the last real
+  // payment and the plan line is clipped to it.
+  const tStart = Math.min(actual[0].t, planPts[0]?.t ?? actual[0].t)
+  const tEnd = Math.max(...actual.map(a => a.t)) + 365 * 24 * 3600 * 1000
+  const planClipped = planPts.filter(p => p.t <= tEnd)
+  const maxV = Math.max(...actual.map(a => a.v), ...planClipped.map(p => p.v), 1)
+  const xMap = t => pad.l + ((t - tStart) / Math.max(tEnd - tStart, 1)) * innerW
   const yMap = v => pad.t + (1 - v / maxV) * innerH
-  const groupW = Math.max(innerW / schedule.length, 16)
-  const barW = Math.max((groupW - 4) / 2, 3)
+  const toPath = pts => pts.map((p, i) => (i === 0 ? 'M' : 'L') + xMap(p.t).toFixed(1) + ',' + yMap(p.v).toFixed(1)).join(' ')
+
   const ticks = 4
   const yTicks = Array.from({length: ticks + 1}, (_, i) => (maxV * i) / ticks)
+  const xTicks = [0, 0.25, 0.5, 0.75, 1].map(fr => tStart + fr * (tEnd - tStart))
+
   return (
-    <div ref={ref}>
-      <svg className="bar-chart" viewBox={`0 0 ${w} ${height}`} height={height}>
+    <div ref={ref} style={{position:'relative'}}>
+      <svg className="area-chart" viewBox={`0 0 ${w} ${height}`} height={height}
+           onMouseMove={e => {
+             const rect = ref.current.querySelector('svg').getBoundingClientRect()
+             const xPx = (e.clientX - rect.left) * (w / rect.width)
+             let best = null
+             for (const a of actual) {
+               const d = Math.abs(xMap(a.t) - xPx)
+               if (!best || d < best.d) best = { d, a }
+             }
+             if (best) setHov({ x: xMap(best.a.t), y: yMap(best.a.v), p: best.a })
+           }}
+           onMouseLeave={() => setHov(null)}>
         {yTicks.map((t, i) => (
           <g key={i}>
             <line className="chart-grid" x1={pad.l} x2={w - pad.r} y1={yMap(t)} y2={yMap(t)}/>
-            <text className="chart-label" x={pad.l - 8} y={yMap(t)} textAnchor="end" dominantBaseline="central">{fmtCurrency(t, {compact:true})}</text>
+            <text className="chart-label" x={pad.l - 8} y={yMap(t)} textAnchor="end" dominantBaseline="central">
+              {fmtCurrency(t)}
+            </text>
           </g>
         ))}
-        {schedule.map((s, i) => {
-          const gx = pad.l + i * groupW + 2
-          return (
-            <g key={s.month}>
-              <rect x={gx} y={yMap(s.principal_cents)} width={barW} height={Math.max(1, innerH - yMap(s.principal_cents) + pad.t)} fill="#4ade80" rx={1}/>
-              <rect x={gx + barW + 2} y={yMap(s.interest_cents)} width={barW} height={Math.max(1, innerH - yMap(s.interest_cents) + pad.t)} fill="#f43f5e" rx={1}/>
-              {i % 12 === 0 && <text className="chart-label" x={gx + barW} y={pad.t + innerH + 16} textAnchor="middle" style={{fontSize:9}}>{s.month}</text>}
-            </g>
-          )
-        })}
+        {xTicks.map((t, i) => (
+          <text key={i} className="chart-label" x={xMap(t)} y={pad.t + innerH + 18} textAnchor="middle">
+            {fmtMonth(new Date(t))}
+          </text>
+        ))}
+        {planClipped.length > 1 && (
+          <path d={toPath(planClipped)} fill="none" stroke="#a78bfa" strokeWidth={1.5}
+                strokeDasharray="4 4" strokeLinejoin="round"/>
+        )}
+        <path d={toPath(actual)} fill="none" stroke="#4ade80" strokeWidth={2} strokeLinejoin="round"/>
+        {actual.filter(a => a.kind === 'extra').map(a => (
+          <circle key={a.t} cx={xMap(a.t)} cy={yMap(a.v)} r={3} fill="#4ade80" stroke="var(--card)" strokeWidth={1.5}/>
+        ))}
+        {hov && (
+          <>
+            <line x1={hov.x} x2={hov.x} y1={pad.t} y2={pad.t + innerH} stroke="var(--foreground)" strokeOpacity="0.3" strokeDasharray="2 3"/>
+            <circle cx={hov.x} cy={hov.y} r={4} fill="#4ade80" stroke="var(--card)" strokeWidth={2}/>
+          </>
+        )}
       </svg>
-      <div style={{display:'flex', gap:14, fontSize:12, color:'var(--muted-foreground)', padding:'4px 0 0 56px'}}>
-        <span><span className="swatch" style={{background:'#4ade80'}}/> Principal</span>
-        <span><span className="swatch" style={{background:'#f43f5e'}}/> Interest</span>
+      {hov && (
+        <div className="tooltip" style={{left: hov.x + 12, top: hov.y + 12, position:'absolute'}}>
+          <div className="t-label">{hov.p.label} · {hov.p.kind === 'extra' ? 'extra principal' : 'monthly payment'}</div>
+          <div className="t-value">{fmtCurrency(hov.p.v, {full:true, decimals:2})} left</div>
+        </div>
+      )}
+      <div style={{display:'flex', gap:14, fontSize:12, color:'var(--muted-foreground)', padding:'6px 0 0 60px'}}>
+        <span><span className="swatch" style={{background:'#4ade80'}}/> Actual balance (dots are extra principal)</span>
+        <span><span className="swatch" style={{background:'#a78bfa'}}/> The loan as originally written</span>
       </div>
     </div>
   )
@@ -5309,7 +5624,7 @@ export default function App() {
       break
     case '/mortgage':
       pageTitle = 'Mortgage'
-      pageContent = <MortgagePage periodId={periodId} />
+      pageContent = <MortgagePage />
       break
     case '/networth':
       pageTitle = 'Net Worth'

@@ -279,77 +279,59 @@ def test_dashboard_category_detail_sorts_by_magnitude(test_client, monkeypatch):
 # F5: Mortgage
 # ═══════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(
-    reason=(
-        "Mortgage/net-worth derivation is retired from the product (owner directive, "
-        "2026-07-24: story 65). The identity cannot hold against the real data: the "
-        "account contains genuine principal-only payments to the servicer totalling "
-        "~$254,691 (single payments of $100k/$50k/$40k/$30k) while the amortization PDF "
-        "states an original loan of ~$155,873, so total_principal_paid exceeds the loan "
-        "and current_balance floors at 0. The transactions are correct; the derived "
-        "figures are not. Kept as a live xfail rather than deleted so the discrepancy "
-        "stays visible if mortgage tracking is ever brought back into scope."
-    ),
-    strict=False,
-)
-def test_amortization_identity_from_prod():
-    """Cross-check amortization via the running API against itself (non-circular: summary vs schedule)."""
-    d = _api_get("/api/amortization?scope=all")
-    s = d["summary"]
-    assert s["original_loan_cents"] - s["current_balance_cents"] == s["equity_cents"]
-    assert s["current_balance_cents"] >= 0
-    # With Option B, totals come from transactions, schedule is pure projection.
-    # If schedule has past rows, their cumulative must match summary.
-    last_past = [r for r in d["schedule"] if r["is_past"]]
-    if last_past:
-        lp = last_past[-1]
-        assert lp["cumulative_principal_cents"] == s["total_principal_paid_cents"]
-        assert lp["cumulative_interest_cents"] == s["total_interest_paid_cents"]
+# The old cross-check that lived here asserted `original_loan - balance == equity`
+# on /api/amortization and was carried as a live xfail whose stated reason was
+# that "mortgage derivation is retired ... the amortization PDF states an original
+# loan of ~$155,873, so total_principal_paid exceeds the loan". That reading of
+# the PDF was the bug, not the data: the PDF is a forward projection whose first
+# row is a mid-life balance, and the loan was $280,000 taken out in February 2025
+# and paid off on 2026-07-08. The identity now holds honestly — principal repaid
+# equals the amount borrowed, balance is 0 — and it is asserted against a fixture
+# in backend/tests/test_mortgage.py rather than against whatever the production
+# container happens to be running.
 
 
 def test_amortization_principal_sum_ignores_positive_amounts(test_client, monkeypatch):
-    """Regression: SUM(ABS(amount_cents)) treated incoming wires the same as outgoing
-    payments, inflating total_principal_paid. Sum must use OUTFLOW magnitude only —
-    positive (income/inflow) rows under Transfer > Mortgage Principal must contribute zero
-    to total_principal_paid_cents."""
+    """Regression: an INFLOW must never count as money paid to the lender.
+
+    Unchanged in intent, retargeted in mechanism. It used to insert rows carrying
+    ``category_path='Transfer > Mortgage Principal'`` — a path the flat category
+    model no longer has, written only by the retired splitter — so it stopped
+    exercising anything real. The rows now look like what the ledger actually
+    holds: payments identified by the servicer's own ACH company id. An outgoing
+    payment must move the total by its magnitude; an incoming credit must not
+    move it at all.
+    """
     import sqlite3
     _import_with_mock(test_client, monkeypatch)
 
-    # Snapshot the current totals reported via the API.
     before = test_client.get("/api/amortization?scope=all").json()["summary"]
-    before_principal = before["total_principal_paid_cents"]
+    before_total = before["total_paid_cents"]
 
-    # Insert one OUTFLOW (-$1,000) and one INFLOW (+$5,000) into the same category.
     db_path = os.environ["DB_PATH"]
     con = sqlite3.connect(db_path)
     try:
-        con.execute(
-            """INSERT INTO transactions
-               (source_platform, source_file, account_id, posted_date, amount_cents,
-                merchant, description, category_path, entity_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("test", "signbug.csv", "acc1", "2026-01-15", -100000,
-             "MortgagePmt", "principal payment", "Transfer > Mortgage Principal", "transfer"),
-        )
-        con.execute(
-            """INSERT INTO transactions
-               (source_platform, source_file, account_id, posted_date, amount_cents,
-                merchant, description, category_path, entity_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            ("test", "signbug.csv", "acc1", "2026-01-16", 500000,
-             "WireIn", "incoming wire mis-tagged", "Transfer > Mortgage Principal", "transfer"),
-        )
+        for amount, desc in (
+            (-100000, "JPMORGAN CHASE   CHASE ACH   PPD ID: 1000008113"),
+            (500000, "Online Payment 1 From HMG 5476 refund"),
+        ):
+            con.execute(
+                """INSERT INTO transactions
+                   (source_platform, source_file, account_id, posted_date, amount_cents,
+                    merchant, description, category_path, entity_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("test", "signbug.csv", "acc1", "2026-01-15", amount,
+                 "HMG Mortgage", desc, "Mortgage Payment", "transfer"),
+            )
         con.commit()
     finally:
         con.close()
 
     after = test_client.get("/api/amortization?scope=all").json()["summary"]
-    delta = after["total_principal_paid_cents"] - before_principal
-    # Delta must equal the magnitude of the OUTFLOW only ($1,000 = 100000 cents).
-    # If the bug were present, delta would be 100000 + 500000 = 600000.
+    delta = after["total_paid_cents"] - before_total
     assert delta == 100000, (
-        f"Sign bug: principal sum changed by {delta} cents, expected 100000 "
-        f"(outflow magnitude only — positive +$5000 row must not count)"
+        f"Sign bug: total paid changed by {delta} cents, expected 100000 "
+        f"(outflow magnitude only — the +$5000 credit must not count)"
     )
 
 
@@ -366,30 +348,16 @@ def test_amortization_schedule_has_is_past(test_client, monkeypatch):
         assert r["is_past"] == expected_past
 
 
-def test_mortgage_components_from_prod():
-    """Count of rows in /api/mortgage/components must equal the count of transactions in
-    those same mortgage categories from /api/transactions — cross-endpoint count equality."""
-    data = _api_get("/api/mortgage/components")
-    valid_cats = [
-        "Transfer > Mortgage Principal", "Transfer > Mortgage Escrow",
-        "Expense > Housing > Mortgage Interest", "Expense > Housing > Mortgage Taxes",
-        "Expense > Housing > Mortgage Insurance",
-    ]
-    valid_set = set(valid_cats)
-    for t in data:
-        assert t.get("category_path") in valid_set, f"Unexpected category {t.get('category_path')}"
-
-    # Cross-check the count via the transactions endpoint by summing per-category totals.
-    txn_total = 0
-    for cat in valid_cats:
-        # urlencode the spaces / '>' in category_prefix
-        from urllib.parse import quote
-        resp = _api_get(f"/api/transactions?category_prefix={quote(cat)}&limit=1&scope=all")
-        txn_total += resp["total"]
-    assert len(data) == txn_total, (
-        f"components endpoint returned {len(data)} rows but /api/transactions filter "
-        f"on the same categories returned {txn_total}"
-    )
+# `GET /api/mortgage/components` is gone, and the three production cross-checks
+# that read it are gone with it. They asserted that the amortization totals equal
+# the sum of rows in `Transfer > Mortgage Principal` / `Expense > Housing >
+# Mortgage Interest` — i.e. they pinned the totals to the splitter's manufactured
+# child rows, whose interest was a constant $843.01 lifted from one row of a
+# projection and applied to every payment including a $100,000 curtailment. A
+# test that certifies fabricated numbers as consistent is worse than no test.
+# What replaced them: backend/tests/test_mortgage.py asserts the totals against a
+# scoped SQL sum over the real payment rows, and asserts that no constant
+# interest appears anywhere in the output.
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -476,50 +444,15 @@ def test_prod_amount_filter_count():
     )
 
 
-def test_prod_amortization_principal_matches_mortgage_components():
-    """total_principal_paid from amortization equals sum of Transfer > Mortgage Principal
-    from mortgage/components — cross-endpoint invariant."""
-    amort = _api_get("/api/amortization?scope=all")
-    comps = _api_get("/api/mortgage/components")
-    comp_principal = sum(abs(t["amount_cents"]) for t in comps
-                         if t["category_path"] == "Transfer > Mortgage Principal")
-    assert amort["summary"]["total_principal_paid_cents"] == comp_principal
-
-
-def test_prod_amortization_interest_matches_mortgage_components():
-    """total_interest_paid from amortization equals sum of Mortgage Interest
-    from mortgage/components — cross-endpoint invariant."""
-    amort = _api_get("/api/amortization?scope=all")
-    comps = _api_get("/api/mortgage/components")
-    comp_interest = sum(abs(t["amount_cents"]) for t in comps
-                        if t["category_path"] == "Expense > Housing > Mortgage Interest")
-    assert amort["summary"]["total_interest_paid_cents"] == comp_interest
-
-
-def test_prod_balance_is_anchored_and_never_negative():
-    """The mortgage position is anchored to the lender schedule, not to a guess.
-
-    Replaces test_prod_equity_zero_if_overpaid. `original_loan_cents` and
-    `equity_cents` are gone on purpose: the original loan predates the imported
-    window and is not derivable, so it is reported as null rather than inferred
-    from the first row of a forward-projection PDF (which is what made the tab
-    claim the loan began in 2026 and that more principal had been paid than the
-    loan was worth).
-    """
-    amort = _api_get("/api/amortization?scope=all")
-    s = amort["summary"]
-    assert s["original_loan_cents"] is None, "must not invent an origination amount"
-    assert s["anchor_month"], "balance has to be anchored to a known date"
-    assert s["anchor_balance_cents"] > 0
-    # Balance is the anchor less the principal actually applied since then.
-    assert s["current_balance_cents"] >= 0
-    assert s["current_balance_cents"] <= s["anchor_balance_cents"]
-    expected = max(0, s["anchor_balance_cents"] - s["principal_paid_since_anchor_cents"])
-    assert s["current_balance_cents"] == expected
-    # And the split must account for the money: principal + interest applied
-    # cannot exceed what was actually paid.
-    assert (s["principal_paid_since_anchor_cents"] + s["interest_paid_since_anchor_cents"]
-            <= s["payments_since_anchor_total_cents"] + 1)
+# Also removed here: `test_prod_amortization_principal_matches_mortgage_components`,
+# `test_prod_amortization_interest_matches_mortgage_components` (both read the
+# deleted components endpoint) and `test_prod_balance_is_anchored_and_never_negative`,
+# which asserted `original_loan_cents is None` and that the balance is the lender
+# projection's anchor less principal since then. Both premises are retired: the
+# loan's terms are recorded facts, the balance is the real balance (zero — the
+# loan is closed), and there is no anchor to hang it on. The successor assertions
+# live in backend/tests/test_mortgage.py, against a fixture, so they no longer
+# depend on the production container having been restarted with current code.
 
 
 # ═══════════════════════════════════════════════════════════════════
