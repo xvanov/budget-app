@@ -145,7 +145,9 @@ const apiCalls = [];
 await page.route('**/api/**', (route) => { apiCalls.push(route.request().url()); route.continue(); });
 const money = () => page.evaluate(() => (document.body.innerText.match(/\$[\d.,]+k?/g) || []).slice(0, 6).join(','));
 
-for (const label of ['Dashboard', 'Income', 'Expenses', 'Refunded', 'Excluded', 'Trends', 'Budgets']) {
+// 'Trends' was removed from the app (its per-category arithmetic disagreed with
+// the dashboard's); 'Merchants' is the period-aware page that replaced it here.
+for (const label of ['Dashboard', 'Income', 'Expenses', 'Refunded', 'Excluded', 'Merchants', 'Budgets']) {
   apiCalls.length = 0;
   await nav(label);
   await settle(1200);
