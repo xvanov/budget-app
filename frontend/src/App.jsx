@@ -105,6 +105,9 @@ const ROUTE_ALIASES = { '/accounts.html': '/accounts' }
 // the topbar control rather than showing a dial that changes nothing.
 const PERIOD_ROUTES = new Set([
   '/', '/txns', '/income', '/expenses', '/refunded', '/excluded', '/budgets', '/trends',
+  // Merchants slices the same rows by payee, so the time window has to compose
+  // with it — that composition is the whole point of the page.
+  '/merchants',
 ])
 
 // ───── Custom period ranges ─────
@@ -5509,6 +5512,515 @@ function ImportBanner({ status }) {
   )
 }
 
+// ── Merchants (spending by vendor) ───────────────────────────────────────────
+// The third slice of the same ledger: the dashboard splits by category, the
+// topbar splits by time, and this splits by WHO WAS PAID. All three compose —
+// the period control drives this page like every other period-aware route, and
+// the category and merchant filters here are ANDed on top of it, so "Groceries
+// at Costco, all time" and "Groceries at Costco, this month" are one query with
+// a different window.
+//
+// Everything is drawn with the components already in this file (KpiCard,
+// DonutChart, AreaChart, Sparkline, TxnTable, CategoryDot) and the existing CSS
+// classes. No new look.
+
+// Bucket keys come back as '2026-01' (month) or '2026-07-05' (week/day); the
+// axis wants something a person reads.
+function fmtBucketLabel(bucket, granularity) {
+  if (!bucket) return ''
+  if (granularity === 'month') {
+    const [y, m] = bucket.split('-')
+    return fmtMonth(new Date(Number(y), Number(m) - 1, 1))
+  }
+  const [y, m, d] = bucket.split('-')
+  return fmtDate(new Date(Number(y), Number(m) - 1, Number(d)))
+}
+
+// The unidentified-payee bucket is addressed by this sentinel, never by an empty
+// string: `merchant_key` returns '' for a row that names nobody, and an empty
+// query parameter is indistinguishable from an absent one. See
+// services/merchant_key.py — an empty key must mean "no match", never "all".
+const UNIDENTIFIED_MERCHANT = '__unidentified__'
+
+// One page of the ranking at a time. The response always reports the full count
+// and what the hidden tail adds up to, and both are shown — a silently truncated
+// ranking is a wrong ranking.
+const MERCHANT_PAGE = 50
+
+function MerchantSpendChart({ series, granularity, color }) {
+  // A single bucket cannot be a line (AreaChart divides by length-1). Say so
+  // rather than emit an SVG with NaN coordinates in it.
+  if (!series || series.length === 0) return null
+  if (series.length < 2) {
+    return (
+      <div className="card-body" style={{color:'var(--muted-foreground)', fontSize:13}}>
+        One {granularity} in this window ({fmtBucketLabel(series[0].bucket, granularity)}
+        {' '}· {fmtCurrency(series[0].spend_cents)}) — widen the period to see a trend.
+      </div>
+    )
+  }
+  return (
+    <div style={{padding:'4px 8px 8px'}}>
+      <AreaChart color={color}
+                 values={series.map(b => ({ x: fmtBucketLabel(b.bucket, granularity), y: b.spend_cents }))}/>
+    </div>
+  )
+}
+
+function MerchantDetailCard({ merchantKey, label, periodId, categories, expectedCents, onClose }) {
+  const { categoryColors } = useContext(AppContext)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [pageSize, setPageSize] = useState(100)
+
+  useEffect(() => {
+    let live = true
+    setLoading(true); setError(null)
+    const period = resolvePeriod(periodId)
+    const qs = new URLSearchParams({
+      merchant_key: merchantKey || UNIDENTIFIED_MERCHANT,
+      start_date: fmtDateParam(period.start),
+      end_date: fmtDateParam(period.end),
+      page_size: String(pageSize),
+      sort: 'abs_amount',
+      dir: 'desc',
+    })
+    for (const c of categories) qs.append('category', c)
+    apiFetch(`/merchants/detail?${qs}`)
+      .then(d => { if (live) { setData(d); setLoading(false) } })
+      .catch(e => { if (live) { setError(e.message); setData(null); setLoading(false) } })
+    return () => { live = false }
+  }, [merchantKey, periodId, categories.join('|'), pageSize])
+
+  const s = data?.summary
+  const txns = data?.transactions || []
+  // The drill-down selects exactly the rows the ranking counted, so these must
+  // agree. If they ever don't, say so instead of hiding it.
+  const mismatch = s && expectedCents != null && s.spend_cents !== expectedCents
+
+  return (
+    <div className="card" data-testid="merchant-detail">
+      <div className="section-head">
+        <div>
+          <div className="h">{label}</div>
+          <div className="sub">
+            {loading ? 'Loading…' : error ? 'Not available' : (
+              `${s.transaction_count} transaction${s.transaction_count === 1 ? '' : 's'} · ` +
+              `${fmtCurrency(s.spend_cents)} net spend · ` +
+              `${fmtCurrency(s.gross_spend_cents)} charged, ${fmtCurrency(s.refund_cents)} refunded · ` +
+              `${s.first_date || '—'} → ${s.last_date || '—'}`
+            )}
+            {categories.length ? ` · filtered to ${categories.join(', ')}` : ''}
+          </div>
+        </div>
+        <button className="btn btn--ghost btn--sm" onClick={onClose} style={{marginLeft:'auto'}}>
+          <Icon name="X" size={14}/> Close
+        </button>
+      </div>
+
+      {error && <div className="msg-banner err" style={{margin:'0 14px 8px'}}>{error}</div>}
+      {mismatch && (
+        <div className="msg-banner err" style={{margin:'0 14px 8px'}}>
+          These rows net {fmtCurrency(s.spend_cents)} but the ranking says{' '}
+          {fmtCurrency(expectedCents)} — that gap is a bug, not a rounding artefact.
+        </div>
+      )}
+
+      {s && (
+        <>
+          {s.refund_attribution_cents !== 0 && (
+            <div className="card-body" style={{paddingBottom:0, fontSize:12, color:'var(--muted-foreground)'}}>
+              {fmtCurrency(Math.abs(s.refund_attribution_cents))} of refunds here reverse a charge
+              outside this window, so they are booked at that charge rather than counted as money
+              back in this period — which is why charged minus refunded does not equal net spend.
+            </div>
+          )}
+          {/* No chart here on purpose: selecting a vendor narrows the page's own
+              "over time" card to that vendor, so a second identical chart would
+              just be the same line twice. This card is the composition and the
+              rows behind the number. */}
+          {(s.categories.length > 1 || s.variant_count > 1) && (
+            <div className="card-body" style={{paddingTop:0}}>
+              {s.categories.length > 1 && (
+                <div className="filter-row" style={{marginBottom:8}}>
+                  <span className="label">Categories</span>
+                  {s.categories.map(c => (
+                    <span key={c.category_path} className="chip is-plain">
+                      <CategoryDot color={categoryColors[c.category_path]}/>
+                      {c.category_path} · {fmtCurrency(c.spend_cents)} ({c.transaction_count})
+                    </span>
+                  ))}
+                </div>
+              )}
+              {s.variant_count > 1 && (
+                <div className="filter-row">
+                  <span className="label">
+                    Grouped from {s.variant_count} raw payee string{s.variant_count === 1 ? '' : 's'}
+                    {s.merged_keys.length > 1 ? ` and ${s.merged_keys.length} keys` : ''}
+                  </span>
+                  {s.variants.slice(0, 6).map(v => (
+                    <span key={v.merchant} className="chip is-plain" title={v.merchant}
+                          style={{maxWidth:260, overflow:'hidden', textOverflow:'ellipsis'}}>
+                      {v.merchant} ×{v.transaction_count}
+                    </span>
+                  ))}
+                  {s.variant_count > 6 && (
+                    <span className="label">+{s.variant_count - 6} more</span>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{overflow:'auto', maxHeight:520}}>
+            <TxnTable txns={txns}/>
+          </div>
+          {data.total > txns.length && (
+            <div className="card-foot" style={{textAlign:'center'}}>
+              <button className="btn btn--outline btn--sm" onClick={() => setPageSize(n => n + 200)}>
+                Show more ({txns.length} of {data.total})
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function MerchantsPage({ periodId }) {
+  const { dataVersion, categoryColors } = useContext(AppContext)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [cats, setCats] = useState([])
+  const [selected, setSelected] = useState(null)      // {key, label, spend}
+  const [sort, setSort] = useState('spend')
+  const [limit, setLimit] = useState(MERCHANT_PAGE)
+  const [search, setSearch] = useState('')
+  const [debounced, setDebounced] = useState('')
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(search.trim()), 250)
+    return () => clearTimeout(t)
+  }, [search])
+
+  // A new period or filter invalidates the ranking page the user had scrolled to.
+  useEffect(() => { setLimit(MERCHANT_PAGE) }, [periodId, cats.join('|'), sort, debounced])
+
+  useEffect(() => {
+    let live = true
+    setLoading(true); setError(null)
+    const period = resolvePeriod(periodId)
+    const qs = new URLSearchParams({
+      start_date: fmtDateParam(period.start),
+      end_date: fmtDateParam(period.end),
+      sort,
+      limit: String(limit),
+    })
+    for (const c of cats) qs.append('category', c)
+    // The selected vendor is part of the filter, not just a drill-down: the KPIs,
+    // the over-time chart and the category chips all narrow to it, while the
+    // ranking below deliberately keeps listing every vendor so another one can be
+    // picked. That faceting is done server-side (see routers/merchants.py).
+    if (selected) qs.append('merchant', selected.key || UNIDENTIFIED_MERCHANT)
+    if (debounced) qs.set('q', debounced)
+    apiFetch(`/merchants?${qs}`)
+      .then(d => { if (live) { setData(d); setLoading(false) } })
+      .catch(e => { if (live) { setError(e.message); setLoading(false) } })
+    return () => { live = false }
+  }, [periodId, cats.join('|'), sort, limit, debounced, selected?.key, dataVersion])
+
+  // A merchant selected under one period may not exist under another; drop the
+  // selection rather than leave a drill-down that 404s.
+  const merchants = data?.merchants || []
+  useEffect(() => {
+    if (!selected || !data) return
+    if (!merchants.some(m => m.merchant_key === selected.key)) setSelected(null)
+  }, [data])
+
+  const period = resolvePeriod(periodId)
+  const totals = data?.totals
+  const ranking = data?.ranking
+  const periodTotal = data?.period_total_spend_cents ?? 0
+  const filtered = cats.length > 0 || selected != null
+  const sharePct = periodTotal > 0 && totals ? (totals.spend_cents / periodTotal) * 100 : null
+  // `totals` narrows to the selected vendor, so it is the wrong denominator for a
+  // "share of the ranking" column. The ranking's own total is what is being
+  // divided up: the rows on screen plus the tail the response accounted for.
+  const rankTotal = merchants.reduce((s, m) => s + m.spend_cents, 0)
+    + (ranking?.hidden_spend_cents || 0)
+
+  function toggleCat(path) {
+    setCats(cur => cur.includes(path) ? cur.filter(c => c !== path) : [...cur, path])
+  }
+
+  // Donut over the visible ranking. Negative-spend merchants (returns outweighed
+  // purchases in this window) cannot be a wedge, so they are named in the note
+  // under the chart instead of silently dropped.
+  const positives = merchants.filter(m => m.spend_cents > 0)
+  const negatives = merchants.filter(m => m.spend_cents <= 0)
+  const donutRows = positives.slice(0, 11).map((m, i) => ({
+    label: m.label, value: m.spend_cents, color: PIE_COLORS[i % PIE_COLORS.length], key: m.merchant_key,
+  }))
+  const donutTailValue = positives.slice(11).reduce((s, m) => s + m.spend_cents, 0)
+    + (ranking?.hidden_spend_cents || 0)
+  const donutSlices = donutTailValue > 0
+    ? [...donutRows, { label: `Everyone else (${positives.length - 11 + (ranking?.hidden_merchants || 0)} merchants)`,
+                       value: donutTailValue, color: OTHER_BUCKET_COLOR }]
+    : donutRows
+  const donutTotal = donutSlices.reduce((s, r) => s + r.value, 0)
+
+  const topShare = rankTotal > 0 && merchants[0]
+    ? (merchants[0].spend_cents / rankTotal) * 100 : null
+
+  return (
+    <div className="page" data-testid="merchants-page">
+      <div className="page-intro">
+        <div className="subtitle">
+          Spending by vendor · {period.label} ·{' '}
+          {ranking ? `${ranking.total_merchants} merchant${ranking.total_merchants === 1 ? '' : 's'}` : '…'}
+          {data?.scope ? ` · ${data.scope} data` : ''}
+          {cats.length ? ` · filtered to ${cats.join(', ')}` : ''}
+        </div>
+        <div className="page-intro-actions">
+          <input className="form-input" style={{width:190, height:34}} value={search}
+                 placeholder="Find a vendor…" aria-label="Find a vendor"
+                 data-testid="merchant-search"
+                 onChange={e => setSearch(e.target.value)}/>
+          <div className="seg">
+            {[['spend','Spend'], ['count','Count'], ['recent','Recent'], ['label','A–Z']].map(([id, lbl]) => (
+              <button key={id} className={`seg-item ${sort === id ? 'is-active' : ''}`}
+                      onClick={() => setSort(id)}>{lbl}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {error && <div className="msg-banner err">{error}</div>}
+
+      {filtered && (
+        <div className="filter-banner" data-testid="merchant-filter-banner">
+          <Icon name="Filter" size={14}/>
+          <span className="filter-banner-label">Showing</span>
+          <span className="filter-banner-value">
+            {selected ? selected.label : 'all vendors'}
+            {cats.length ? ` in ${cats.join(' + ')}` : ''} · {period.label}
+          </span>
+          {sharePct != null && (
+            <span className="filter-banner-label">
+              {fmtCurrency(totals.spend_cents)} of {fmtCurrency(periodTotal)} ({sharePct.toFixed(1)}%)
+            </span>
+          )}
+          <button className="btn btn--ghost btn--sm" style={{marginLeft:'auto'}}
+                  onClick={() => { setCats([]); setSelected(null) }}>
+            <Icon name="X" size={13}/> Clear filters
+          </button>
+        </div>
+      )}
+
+      <div className="kpi-grid">
+        <KpiCard label={filtered ? 'Spend (filtered)' : 'Total spend'}
+                 value={fmtCurrency(totals?.spend_cents ?? 0)}
+                 sub={filtered ? `of ${fmtCurrency(periodTotal)} this period` : period.label}
+                 sparkValues={(data?.series || []).map(b => b.spend_cents)}/>
+        <KpiCard label="Transactions" value={(totals?.transaction_count ?? 0).toLocaleString()}
+                 sub={`${ranking?.total_merchants ?? 0} vendors`}/>
+        <KpiCard label="Refunded" value={fmtCurrency(totals?.refund_cents ?? 0)}
+                 sub="netted against the charge, not counted as income"/>
+        <KpiCard label="Top vendor share"
+                 value={topShare == null ? '—' : topShare.toFixed(1) + '%'}
+                 sub={merchants[0]?.label || '—'}/>
+      </div>
+
+      {data?.by_category?.length > 0 && (
+        <div className="card">
+          <div className="card-header col">
+            <div className="card-title">Filter by category</div>
+            <div className="sub subtitle">
+              Cumulative with the period above and with the vendor you pick below.
+              {selected ? ` Amounts shown are ${selected.label}'s.` : ''}
+              {data.diagnostics?.non_spending_categories?.length
+                ? ` ${data.diagnostics.non_spending_categories.length} categor` +
+                  `${data.diagnostics.non_spending_categories.length === 1 ? 'y' : 'ies'}` +
+                  ` net positive over this window, so ${data.diagnostics.non_spending_categories.length === 1 ? 'it is' : 'they are'}` +
+                  ` money in rather than spending and ${data.diagnostics.non_spending_categories.length === 1 ? 'is' : 'are'}` +
+                  ` not listed: ${data.diagnostics.non_spending_categories.join(', ')}.`
+                : ''}
+            </div>
+          </div>
+          <div className="card-body">
+            <div className="filter-row">
+              {data.by_category.map(c => (
+                <button key={c.category_path}
+                        className={`chip ${cats.includes(c.category_path) ? 'is-active' : ''}`}
+                        onClick={() => toggleCat(c.category_path)}
+                        title={`${c.merchant_count} vendor${c.merchant_count === 1 ? '' : 's'}, ${c.transaction_count} transactions`}>
+                  <CategoryDot color={categoryColors[c.category_path]}/>
+                  {c.category_path}
+                  <span className="mono" style={{color:'var(--muted-foreground)'}}>
+                    {fmtCurrency(c.spend_cents)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="card-header col">
+          <div className="card-title">
+            {selected ? `${selected.label} over time` : 'Spend over time'}
+          </div>
+          <div className="sub subtitle">
+            {data ? `${data.period.granularity}ly buckets · ${period.label}` : ''}
+          </div>
+        </div>
+        <MerchantSpendChart series={data?.series} granularity={data?.period?.granularity}/>
+      </div>
+
+      {loading && !data ? (
+        <div className="card" style={{padding:20}}>Loading…</div>
+      ) : merchants.length === 0 ? (
+        // Gated on the RANKING being empty, not on the filtered total: a vendor
+        // with no rows in the picked category still needs the list on screen so
+        // another vendor can be chosen.
+        <div className="card" style={{padding:20, color:'var(--muted-foreground)'}}>
+          No spending {cats.length ? `in ${cats.join(', ')} ` : ''}for {period.label}
+          {debounced ? ` matching “${debounced}”` : ''}. Widen the period or clear the filters.
+        </div>
+      ) : (
+        <div className="card">
+          <div className="section-head">
+            <div>
+              <div className="h">Vendors by spend</div>
+              <div className="sub">
+                {ranking.returned} of {ranking.total_merchants} shown
+                {ranking.hidden_merchants > 0
+                  ? ` · ${ranking.hidden_merchants} more, netting ` +
+                    `${fmtCurrency(ranking.hidden_spend_cents)} between them` +
+                    (ranking.hidden_spend_cents < 0 ? ' (money back, on balance)' : '')
+                  : ''}
+                {' · click a vendor for its transactions and its trend'}
+              </div>
+            </div>
+          </div>
+          <div style={{display:'flex', gap:26, flexWrap:'wrap', alignItems:'flex-start', padding:16}}>
+            {donutSlices.length > 0 && (
+              <div>
+                <DonutChart slices={donutSlices} total={donutTotal}/>
+                {negatives.length > 0 && (
+                  <div className="subtitle" style={{maxWidth:230, marginTop:8}}>
+                    {negatives.length} entr{negatives.length === 1 ? 'y' : 'ies'} net to zero or
+                    below over this window — money came back (a refund, or a credit or deposit
+                    posted to a spending category). They reduce their category exactly as the
+                    dashboard has them do, so they cannot be a wedge; they are at the bottom of
+                    the table.
+                  </div>
+                )}
+              </div>
+            )}
+            <div style={{flex:1, minWidth:340, overflowX:'auto'}}>
+              <table className="tbl" data-testid="merchant-table" style={{minWidth:560}}>
+                <thead><tr>
+                  <th>Vendor</th>
+                  <th>Categories</th>
+                  <th className="text-right" style={{width:70}}>Txns</th>
+                  <th style={{width:90}}>Trend</th>
+                  <th className="text-right" style={{width:110}}>Spend</th>
+                  <th className="text-right" style={{width:70}}>Share</th>
+                </tr></thead>
+                <tbody>
+                  {merchants.map((m, i) => {
+                    const isOpen = selected?.key === m.merchant_key
+                    return (
+                      <tr key={m.merchant_key || UNIDENTIFIED_MERCHANT}
+                          data-testid="merchant-row"
+                          title={`Show the transactions behind ${m.label}`}
+                          onClick={() => setSelected(isOpen ? null : {
+                            key: m.merchant_key, label: m.label, spend: m.spend_cents })}
+                          style={{cursor:'pointer', background: isOpen
+                            ? 'color-mix(in oklab, var(--primary) 14%, transparent)' : 'transparent'}}>
+                        <td style={{fontSize:12.5, fontWeight:500}}>
+                          <span className="swatch" style={{
+                            background: i < 11 && m.spend_cents > 0
+                              ? PIE_COLORS[i % PIE_COLORS.length] : OTHER_BUCKET_COLOR,
+                            marginRight:6,
+                          }}/>
+                          {m.label}
+                          {m.unidentified && (
+                            <span className="label" style={{marginLeft:6, fontSize:11, color:'var(--muted-foreground)'}}>
+                              (no payee in the text)
+                            </span>
+                          )}
+                          {/* An entry can net to zero or below: a refund, or a
+                              credit/deposit that landed on a spending category and
+                              so reduces it. Saying so beats a bare minus sign. */}
+                          {m.spend_cents <= 0 && (
+                            <span className="label" style={{marginLeft:6, fontSize:11, color:'var(--muted-foreground)'}}>
+                              (money back)
+                            </span>
+                          )}
+                          <Icon name={isOpen ? 'ChevronDown' : 'ChevronRight'} size={11}/>
+                        </td>
+                        <td style={{fontSize:11.5, color:'var(--muted-foreground)'}}>
+                          {m.categories.slice(0, 2).map(c => (
+                            <span key={c.category_path} style={{marginRight:8, whiteSpace:'nowrap'}}>
+                              <CategoryDot color={categoryColors[c.category_path]} size={7}/>{c.category_path}
+                            </span>
+                          ))}
+                          {m.categories.length > 2 ? `+${m.categories.length - 2}` : ''}
+                        </td>
+                        <td className="text-right mono" style={{color:'var(--muted-foreground)'}}>
+                          {m.transaction_count}
+                        </td>
+                        <td>
+                          <Sparkline values={(m.series || []).map(b => b.spend_cents)}
+                                     color={PIE_COLORS[i % PIE_COLORS.length]} height={22}/>
+                        </td>
+                        <td className="text-right mono">{fmtCurrency(m.spend_cents)}</td>
+                        <td className="text-right mono" style={{color:'var(--muted-foreground)'}}>
+                          {rankTotal > 0
+                            ? ((m.spend_cents / rankTotal) * 100).toFixed(1) + '%' : '—'}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          {ranking.hidden_merchants > 0 && (
+            <div className="card-foot" style={{textAlign:'center'}}>
+              <button className="btn btn--outline btn--sm" data-testid="merchant-show-more"
+                      onClick={() => setLimit(n => n + MERCHANT_PAGE * 2)}>
+                Show more — {ranking.hidden_merchants} vendors not shown,{' '}
+                {fmtCurrency(ranking.hidden_spend_cents)} between them
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {selected && (
+        <MerchantDetailCard merchantKey={selected.key} label={selected.label} periodId={periodId}
+                            categories={cats} expectedCents={selected.spend}
+                            onClose={() => setSelected(null)}/>
+      )}
+
+      {data?.diagnostics?.split_parent_rows_excluded > 0 && (
+        <div className="msg-banner">
+          {data.diagnostics.split_parent_rows_excluded} combined charge(s) that were split into
+          item rows are excluded here so their {fmtCurrency(Math.abs(data.diagnostics.split_parent_cents_excluded))}{' '}
+          is not counted twice — the item rows carry it.
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ───── App Shell ─────
 export default function App() {
   const [route, setRoute] = useState(() => localStorage.getItem('budget-route') || '/')
@@ -5581,6 +6093,9 @@ export default function App() {
     { id: '/txns', label: 'Transactions', icon: 'Receipt' },
     { id: '/income', label: 'Income', icon: 'TrendingUp' },
     { id: '/expenses', label: 'Expenses', icon: 'PieChart' },
+    // Sits next to Expenses because it is the same money cut a different way:
+    // Expenses answers "on what?", Merchants answers "to whom?".
+    { id: '/merchants', label: 'Merchants', icon: 'Tag' },
     { id: '/refunded', label: 'Refunded', icon: 'Repeat' },
     { id: '/excluded', label: 'Excluded', icon: 'X' },
     { id: '/mortgage', label: 'Mortgage', icon: 'Building' },
@@ -5645,6 +6160,10 @@ export default function App() {
     case '/expenses':
       pageTitle = 'Expenses'
       pageContent = <FlowPage flow="expense" periodId={periodId} />
+      break
+    case '/merchants':
+      pageTitle = 'Merchants'
+      pageContent = <MerchantsPage periodId={periodId} />
       break
     case '/refunded':
       pageTitle = 'Refunded'
