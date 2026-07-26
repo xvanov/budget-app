@@ -11,7 +11,7 @@ from app.database import get_db
 from app.services.account_meta import account_ids_by_kinds
 from app.services.transfer_detector import detect_transfers
 from app.services.categorizer import categorize_uncategorized
-from app.services.mortgage_splitter import split_mortgage_payments
+from app.services.mortgage import remove_fabricated_splits
 from app.services.import_state import import_state
 
 logger = logging.getLogger(__name__)
@@ -236,7 +236,6 @@ async def import_samples(categorize: bool = True, categorize_limit: int = 0):
 
     results = []
     db = await get_db()
-    mortgage_result = {"split": 0, "warnings": []}
     try:
         for idx, filepath in enumerate(files):
             filename = os.path.basename(filepath)
@@ -368,8 +367,13 @@ async def import_samples(categorize: bool = True, categorize_limit: int = 0):
             import_state.progress(len(files), "Skipping categorization (categorize=false)")
         import_state.progress(len(files), "Detecting transfers…")
         await detect_transfers(db)
-        import_state.progress(len(files), "Splitting mortgage payments…")
-        mortgage_result = await split_mortgage_payments(db)
+        # No mortgage split step. Splitting a payment into principal/interest
+        # child rows required inventing an interest figure per payment (the old
+        # splitter copied a constant $843.01 out of a forward projection); the
+        # Mortgage tab now derives that split at read time from the real balance.
+        # What remains is removing any children a previous version wrote.
+        import_state.progress(len(files), "Clearing fabricated mortgage splits…")
+        await remove_fabricated_splits(db)
 
         await db.commit()
 
@@ -382,9 +386,6 @@ async def import_samples(categorize: bool = True, categorize_limit: int = 0):
         import_state.fail(str(e))
         raise
     finally:
-        if mortgage_result.get("warnings"):
-            for w in mortgage_result["warnings"]:
-                logger.warning("Mortgage split: %s", w)
         await db.close()
 
     return ImportResponse(results=results)

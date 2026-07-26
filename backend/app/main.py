@@ -50,6 +50,27 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Account meta seed failed: %s", exc)
 
+    # Mortgage. Two idempotent steps:
+    #   * seed the owner's stated loan terms into `mortgage_facts` if that table
+    #     has no row yet — the terms are in the closing documents, not in any
+    #     bank export, so they have to be recorded somewhere the user can edit;
+    #   * delete the principal/interest child rows the retired
+    #     `mortgage_splitter` manufactured with a constant $843.01 of interest.
+    #     The split is now derived at read time, so those rows are pure fiction
+    #     sitting in the ledger.
+    try:
+        from app.database import get_db
+        from app.services.mortgage import remove_fabricated_splits, seed_owner_facts
+
+        db = await get_db()
+        try:
+            await seed_owner_facts(db)
+            await remove_fabricated_splits(db)
+        finally:
+            await db.close()
+    except Exception as exc:
+        logger.warning("Mortgage setup failed: %s", exc)
+
     try:
         await backfill_explainability()
     except Exception:

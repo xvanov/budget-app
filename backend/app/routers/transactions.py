@@ -1288,168 +1288,77 @@ async def get_dashboard_category_detail(
 
 @router.get("/api/amortization")
 async def get_amortization(scope: Optional[str] = "plaid"):
-    """Mortgage position derived from ACTUAL transactions, with an honest anchor.
+    """DEPRECATED — a thin alias over ``GET /api/mortgage``.
 
-    Two bugs this replaces:
+    What used to be here computed the mortgage position by anchoring on the first
+    row of the ``amortization`` table and adding up transactions whose
+    ``category_path`` happened to be ``Transfer > Mortgage Principal``. Both legs
+    were wrong: the table is a FORWARD PROJECTION issued in 2026 (so its first
+    row is a mid-life balance, not an origination), and those category paths were
+    written by ``mortgage_splitter``, which manufactured the principal/interest
+    split from a constant $843.01 of interest. The categories themselves no
+    longer exist in the flat model, so the totals were drifting to zero.
 
-    1. The paid totals were summed UNSCOPED, so the CSV history and its Plaid
-       twins were both counted — $271,821 + $274,007 for the same payments.
-    2. ``original_loan`` was taken from the first row of the amortization PDF.
-       That PDF is a FORWARD PROJECTION starting 2026-06-01, not the loan's
-       history, so its first row is a mid-life balance. Treating it as
-       origination is what made the tab look like the loan began in 2026, and it
-       made "principal paid" exceed the loan.
-
-    What is actually knowable here:
-      * The lender schedule gives a BALANCE AT A KNOWN DATE (the anchor).
-      * The ledger gives real principal payments, which reduce that balance from
-        the anchor forward.
-      * The original loan amount is NOT derivable from either — payments predate
-        the imported window. It is reported as null rather than invented.
+    ``services/mortgage.analyze`` replaces all of it: real payments to the
+    servicer, a real amortization over the owner's stated terms, and a basis
+    label on every figure. This endpoint stays only so older callers keep
+    working; the Mortgage tab reads ``/api/mortgage``.
     """
     from datetime import datetime, timezone
 
+    from app.services.mortgage import analyze
+
     db = await get_db()
     try:
-        scope_sql, _p, effective_scope, _n = await resolve_scope(db, scope)
+        data = await analyze(db, scope)
+        figures = data["figures"]
         today_ym = datetime.now(timezone.utc).strftime("%Y-%m")
 
-        cursor = await db.execute("SELECT * FROM amortization ORDER BY month")
-        rows = [dict(r) for r in await cursor.fetchall()]
-
-        anchor_month = rows[0]["month"][:7] if rows else None
-        anchor_balance_cents = rows[0]["ending_balance_cents"] if rows else None
-
-        async def paid_since(category_path, since_month=None):
-            clauses = ["category_path = ?"]
-            params = [category_path]
-            if since_month:
-                clauses.append("posted_date >= ?")
-                params.append(f"{since_month}-01")
-            cursor = await db.execute(
-                f"""SELECT COALESCE(SUM(CASE WHEN amount_cents < 0 THEN -amount_cents ELSE 0 END), 0) total,
-                           COUNT(*) n
-                    FROM transactions t
-                    WHERE {' AND '.join(clauses)} {scope_sql}""",
-                params,
-            )
-            row = await cursor.fetchone()
-            return row[0], row[1]
-
-        principal_all, principal_count = await paid_since("Transfer > Mortgage Principal")
-        interest_all, _ = await paid_since("Expense > Housing > Mortgage Interest")
-        escrow_all, _ = await paid_since("Transfer > Mortgage Escrow")
-        principal_since_anchor, payments_since_anchor = await paid_since(
-            "Transfer > Mortgage Principal", anchor_month
-        )
-
-
-        # Actual payments by month, straight from the ledger.
-        cursor = await db.execute(
-            f"""SELECT substr(posted_date, 1, 7) month,
-                       COALESCE(SUM(CASE WHEN amount_cents < 0 THEN -amount_cents ELSE 0 END), 0) principal_cents,
-                       COUNT(*) payment_count
-                FROM transactions t
-                WHERE category_path = 'Transfer > Mortgage Principal' {scope_sql}
-                GROUP BY month ORDER BY month"""
-        )
-        actual_by_month = [dict(r) for r in await cursor.fetchall()]
-
-        # Split each month's payments into principal vs interest using the lender
-        # schedule, instead of crediting the whole payment to principal.
-        #
-        # A regular monthly payment is principal + interest (+ escrow) — counting
-        # all of it as principal understates the balance, and it is why
-        # total_interest_paid read $0.00 for a mortgage that obviously accrues
-        # interest. Anything paid ABOVE the scheduled P&I in a month is an extra
-        # paydown and is 100% principal. No merchant matching needed:
-        #   principal = min(paid, scheduled_P) + max(0, paid - scheduled_P - scheduled_I)
-        by_month_paid = {m["month"]: m["principal_cents"] for m in actual_by_month}
-        sched_by_month = {r["month"][:7]: r for r in rows}
-
-        principal_applied = 0
-        interest_applied = 0
-        unscheduled_months = []
-        for month, paid in sorted(by_month_paid.items()):
-            if anchor_month and month < anchor_month:
-                continue  # already reflected in the anchor balance
-            sched = sched_by_month.get(month)
-            if not sched:
-                # No schedule for this month: cannot separate interest, so treat
-                # the payment as principal and say so rather than inventing a split.
-                principal_applied += paid
-                unscheduled_months.append(month)
-                continue
-            sched_p = sched["principal_cents"]
-            sched_i = sched["interest_cents"]
-            scheduled_principal = min(paid, sched_p)
-            extra = max(0, paid - sched_p - sched_i)
-            principal_applied += scheduled_principal + extra
-            interest_applied += min(max(0, paid - scheduled_principal), sched_i)
-
-        current_balance_cents = None
-        if anchor_balance_cents is not None:
-            current_balance_cents = max(0, anchor_balance_cents - principal_applied)
-
-        # Individual payments, so the page can show what it is based on.
-        cursor = await db.execute(
-            f"""SELECT id, posted_date, amount_cents, merchant, description, account_id
-                FROM transactions t
-                WHERE category_path = 'Transfer > Mortgage Principal' {scope_sql}
-                ORDER BY posted_date DESC LIMIT 200"""
-        )
-        payments = [dict(r) for r in await cursor.fetchall()]
-
-        # The lender schedule stays a projection and is labelled as one.
         schedule = []
-        for r in rows:
-            row_month = r["month"][:7] if r["month"] else ""
+        for row in data["lender_projection"]:
+            row_month = (row.get("month") or "")[:7]
             schedule.append({
-                "id": r["id"],
-                "month": r["month"],
-                "principal_cents": r["principal_cents"],
-                "interest_cents": r["interest_cents"],
-                "ending_balance_cents": r["ending_balance_cents"],
+                "id": row.get("id"),
+                "month": row.get("month"),
+                "principal_cents": row.get("principal_cents"),
+                "interest_cents": row.get("interest_cents"),
+                "ending_balance_cents": row.get("ending_balance_cents"),
                 "is_past": row_month <= today_ym,
                 "is_projection": True,
             })
 
+        by_month = {}
+        for payment in data["timeline"]:
+            month = payment["posted_date"][:7]
+            bucket = by_month.setdefault(
+                month, {"month": month, "paid_cents": 0, "principal_cents": 0,
+                        "interest_cents": 0, "escrow_cents": 0, "payment_count": 0})
+            bucket["paid_cents"] += payment["amount_cents"]
+            bucket["principal_cents"] += payment.get("principal_cents") or 0
+            bucket["interest_cents"] += payment.get("interest_cents") or 0
+            bucket["escrow_cents"] += payment.get("escrow_cents") or 0
+            bucket["payment_count"] += 1
+
         return {
+            "deprecated": "Use GET /api/mortgage — it carries the basis of every figure.",
             "schedule": schedule,
-            "actual_by_month": actual_by_month,
-            "payments": payments,
+            "actual_by_month": [by_month[m] for m in sorted(by_month)],
+            "payments": data["timeline"],
             "summary": {
-                # Not derivable from the data we hold — say so instead of guessing.
-                "original_loan_cents": None,
-                "anchor_month": anchor_month,
-                "anchor_balance_cents": anchor_balance_cents,
-                "current_balance_cents": current_balance_cents,
-                "principal_paid_since_anchor_cents": principal_applied,
-                "interest_paid_since_anchor_cents": interest_applied,
-                "payments_since_anchor_total_cents": principal_since_anchor,
-                "payments_since_anchor": payments_since_anchor,
-                "total_principal_paid_cents": principal_all,
-                "total_principal_payment_count": principal_count,
-                "total_interest_paid_cents": interest_all,
-                "total_escrow_paid_cents": escrow_all,
-                "scope": effective_scope,
+                "status": data["status"],
+                "payoff_date": data["payoff_date"],
+                "original_loan_cents": figures["original_loan"]["cents"],
+                "original_loan_basis": figures["original_loan"]["basis"],
+                "current_balance_cents": figures["final_balance"]["cents"],
+                "total_paid_cents": figures["total_paid_to_lender"]["cents"],
+                "total_principal_paid_cents": figures["principal_paid"]["cents"],
+                "total_interest_paid_cents": figures["interest_paid"]["cents"],
+                "total_escrow_paid_cents": figures["escrow_paid"]["cents"],
+                "extra_principal_paid_cents": figures["extra_principal_paid"]["cents"],
+                "scope": data["scope"],
             },
-            "unscheduled_payment_months": unscheduled_months,
-            "notes": [
-                (f"Balance is anchored to the lender schedule at {anchor_month} "
-                 f"(${(anchor_balance_cents or 0)/100:,.2f}) and reduced by actual principal "
-                 f"payments recorded since then."
-                 if anchor_month else
-                 "No lender schedule imported, so the outstanding balance cannot be stated."),
-                ("The original loan amount is not derivable from the imported data — the loan "
-                 "predates the transaction window — so it is not shown rather than guessed."),
-                (f"Totals use the {effective_scope} scope. Summing every source would count the "
-                 f"same payment twice, once from the CSV history and once from Plaid."),
-                ("Each month's payments are split using the lender schedule: up to the scheduled "
-                 "principal counts as principal, the scheduled interest as interest, and anything "
-                 "paid above scheduled P&I is an extra paydown (100% principal). Crediting the "
-                 "whole monthly payment to principal would understate the balance."),
-            ],
+            "notes": data["notes"],
+            "warnings": data["warnings"],
         }
     finally:
         await db.close()
