@@ -4706,6 +4706,9 @@ function MortgagePage() {
       annual_rate_bps: f.annual_rate_bps ?? '',
       term_months: f.term_months ?? '',
       first_payment_date: f.first_payment_date ?? '',
+      origination_date: f.origination_date ?? '',
+      purchase_price_cents: f.purchase_price_cents ?? '',
+      down_payment_cents: f.down_payment_cents ?? '',
       escrow_refund_cents: f.escrow_refund_cents ?? '',
       escrow_refund_date: f.escrow_refund_date ?? '',
     })
@@ -5047,13 +5050,13 @@ function MortgagePage() {
                     <label className="form-label">Amount borrowed (cents)</label>
                     <input className="form-input" type="number" value={form.original_principal_cents}
                            onChange={e => setForm(s => ({...s, original_principal_cents: e.target.value}))}
-                           placeholder="e.g. 28000000 for $280,000"/>
+                           placeholder="e.g. 12345600 for $123,456"/>
                   </div>
                   <div className="form-group">
                     <label className="form-label">Rate (basis points)</label>
                     <input className="form-input" type="number" value={form.annual_rate_bps}
                            onChange={e => setForm(s => ({...s, annual_rate_bps: e.target.value}))}
-                           placeholder="e.g. 649 for 6.49%"/>
+                           placeholder="e.g. 575 for 5.75%"/>
                   </div>
                 </div>
                 <div className="form-row">
@@ -5070,10 +5073,29 @@ function MortgagePage() {
                 </div>
                 <div className="form-row">
                   <div className="form-group">
+                    <label className="form-label">Closing date</label>
+                    <input className="form-input" type="date" value={form.origination_date}
+                           onChange={e => setForm(s => ({...s, origination_date: e.target.value}))}/>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Purchase price (cents)</label>
+                    <input className="form-input" type="number" value={form.purchase_price_cents}
+                           onChange={e => setForm(s => ({...s, purchase_price_cents: e.target.value}))}
+                           placeholder="what the house cost"/>
+                  </div>
+                </div>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Down payment (cents)</label>
+                    <input className="form-input" type="number" value={form.down_payment_cents}
+                           onChange={e => setForm(s => ({...s, down_payment_cents: e.target.value}))}
+                           placeholder="cash you put in at closing"/>
+                  </div>
+                  <div className="form-group">
                     <label className="form-label">Escrow refunded (cents)</label>
                     <input className="form-input" type="number" value={form.escrow_refund_cents}
                            onChange={e => setForm(s => ({...s, escrow_refund_cents: e.target.value}))}
-                           placeholder="e.g. 160000 for $1,600"/>
+                           placeholder="the refund the servicer sent back"/>
                   </div>
                   <div className="form-group">
                     <label className="form-label">Escrow refund date</label>

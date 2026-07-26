@@ -18,27 +18,30 @@ What this module does instead
    total them. That total is exact: ``total_paid_to_lender``.
 2. **Derive the split honestly.** A single $3,722.53 ACH cannot be decomposed by
    looking at it. It can be decomposed by running a real amortization over the
-   actual payment stream. The terms come from the owner (``mortgage_facts``):
-   $280,000 for 120 months at 6.49%, first payment 2025-04-01. Those three facts
-   fix the scheduled P&I at 280000·i/(1-(1+i)^-120) = **$3,177.92**, so escrow on
-   any monthly payment is ``amount - P&I``: $544.61 while the autopay was
-   $3,722.53, $896.88 for the one-off $4,074.80 in 2026-03, $748.05 after the
-   escrow re-analysis settled the autopay at $3,925.97.
-3. **Cross-check the terms instead of trusting them.** Independent checks run on
-   every request and are returned in ``checks``:
-     * the lender's own schedule gives ``interest / opening_balance`` = 0.0054083
-       per month on all 58 rows → 6.4900%/yr, agreeing with the stated 6.49%;
-     * the schedule's ``principal + interest`` is $3,177.92 on every row, equal
-       to the payment the stated terms imply, to the cent;
-     * the origination amount is itself re-derivable: with the rate and P&I
-       fixed, the final balance is an AFFINE function of the amount borrowed, so
-       requiring the loan to close at $0 on the payoff payment solves it. Over
-       the owner's real payment stream that solve returns $279,999.99 — the
-       stated $280,000, from the ledger alone, without being told.
-   The simulation also passes exactly through the lender projection's own opening
-   balance of $155,873.06 immediately after the April 2026 $100,000 curtailment.
-   Four agreements on numbers that had no reason to agree unless the model is
-   right.
+   actual payment stream, using two terms the lender's own schedule states even
+   though the schedule's dates are useless:
+     * the monthly rate — ``interest / opening_balance`` is 0.0054083 on all 58
+       rows, i.e. 6.4900%/yr;
+     * the scheduled P&I — ``principal + interest`` is $3,177.92 on every row.
+   Escrow on any monthly payment is then ``amount - P&I``: $544.61 while the
+   autopay was $3,722.53, $896.88 for the one-off $4,074.80 in 2026-03, $748.05
+   after the escrow re-analysis settled the autopay at $3,925.97.
+3. **Solve the one term nobody stated.** The amount borrowed predates the imported
+   window, but it is not free: with the rate and P&I fixed, the final balance is
+   an AFFINE function of it, so requiring the loan to close at $0 on the payoff
+   payment solves it in closed form. On the owner's real stream that returns
+   $279,999.99 — a $280,000 loan — and it is reported as ``inferred``, never as
+   fact. Three things then agree that had no reason to:
+     * 280000·i/(1-(1+i)^-120) = $3,177.92, the schedule's own payment, to the
+       cent — so the implied term is exactly 120 months;
+     * the simulated balance passes through $155,873.06 straight after the April
+       2026 $100,000 curtailment, which is the lender projection's own opening
+       balance, a number this module never fitted to;
+     * the payments then account for themselves exactly: principal + interest +
+       escrow equals the cash paid, ending at zero.
+   Nothing here is seeded from a human's recollection. Whatever the owner does
+   record in ``mortgage_facts`` overrides the derivation and is relabelled
+   ``stated``.
 4. **Label everything.** Every figure carries a ``basis``:
      ``measured`` — a sum over real transactions;
      ``derived``  — computed from measured rows plus the loan terms;
@@ -110,17 +113,22 @@ FACT_FIELDS = (
     "note",
 )
 
-# What the owner said on 2026-07-25, seeded ONCE into an empty facts row so the
-# tab is right out of the box. Not hardcoded into the arithmetic: it is data, the
-# owner can change any of it through PUT /api/mortgage/facts, and if the row
-# already exists this seed does nothing.
+# The owner's own answers, given on 2026-07-25 when asked directly for the loan
+# terms. These are ``stated`` in the strict sense this module cares about: a human
+# typed them, they did not come from an inference.
 #
-# ``down_payment_confidence='believed'`` is carried deliberately. The owner's
-# words were "i do believe this was the down payment. the home cost 400k, and
-# there were some closing costs" — and $400,000 purchase - $280,000 borrowed =
-# $120,000, against a $123,212.42 wire, i.e. $120,000 down plus $3,212.42 of
-# closing costs. That reconciles, but it is corroboration, not a receipt, so the
-# UI says "believed" instead of asserting it.
+# The distinction matters and must not be blurred: this module can *also* work out
+# $280,000 / 6.49% / $3,177.92 for itself, and labels that ``inferred``. Seeding
+# below is legitimate only because the figures were supplied, and the fact that
+# the independent solve lands on $279,999.98 is corroboration, not the source.
+#
+# Deliberately NOT seeded, because the owner did not state them: the origination
+# date (only the first payment date is known), and the escrow refund (~$1,600 by
+# the owner's recollection, but no amount or date was given and nothing in the
+# ledger matches — they chose to skip it). `down_payment_confidence='believed'`
+# records that the owner said "i do believe this was the down payment" about the
+# 2025-02-10 wire rather than confirming it; $400,000 − $280,000 = $120,000 with
+# the remaining $3,212.42 as closing costs is what makes that wire add up.
 OWNER_STATED_FACTS = {
     "original_principal_cents": 28_000_000,
     "annual_rate_bps": 649,
@@ -130,7 +138,8 @@ OWNER_STATED_FACTS = {
     "purchase_price_cents": 40_000_000,
     "down_payment_cents": 12_000_000,
     "down_payment_confidence": "believed",
-    "note": "Terms as stated by the owner on 2026-07-25 (10-year loan, paid off early).",
+    "note": "Terms as stated by the owner on 2026-07-25: 10-year loan at 6.49%, "
+            "$400k purchase, paid off early.",
 }
 
 
@@ -155,26 +164,18 @@ async def ensure_facts_table(db) -> None:
                updated_at TEXT DEFAULT (datetime('now'))
            )"""
     )
-    # Columns added after the table first shipped.
-    for column, ddl in (
-        ("scheduled_payoff_date", "ALTER TABLE mortgage_facts ADD COLUMN scheduled_payoff_date TEXT"),
-        ("purchase_price_cents", "ALTER TABLE mortgage_facts ADD COLUMN purchase_price_cents INTEGER"),
-        ("down_payment_cents", "ALTER TABLE mortgage_facts ADD COLUMN down_payment_cents INTEGER"),
-        ("down_payment_date", "ALTER TABLE mortgage_facts ADD COLUMN down_payment_date TEXT"),
-        ("down_payment_confidence", "ALTER TABLE mortgage_facts ADD COLUMN down_payment_confidence TEXT"),
-    ):
-        try:
-            await db.execute(ddl)
-        except Exception:
-            pass  # already present
+    # Any future column goes on with an ALTER here, in the same shape the rest of
+    # `database.py` uses. Nothing to migrate yet — this table ships complete.
     await db.commit()
 
 
 async def seed_owner_facts(db) -> bool:
-    """Write ``OWNER_STATED_FACTS`` if the owner has no facts row yet.
+    """Write ``OWNER_STATED_FACTS`` once, if the owner has no facts row yet.
 
-    Returns True when it seeded. Never overwrites: once the row exists, the
-    owner's edits are the truth and this is a no-op forever.
+    Returns True when it seeded. Never overwrites: the moment a row exists, the
+    owner's edits through ``PUT /api/mortgage/facts`` are the truth and this is a
+    no-op forever. So correcting a figure in the UI sticks across restarts, and a
+    field cleared to NULL stays cleared.
     """
     await ensure_facts_table(db)
     cursor = await db.execute("SELECT 1 FROM mortgage_facts WHERE id = 1")
@@ -187,7 +188,7 @@ async def seed_owner_facts(db) -> bool:
         list(OWNER_STATED_FACTS.values()),
     )
     await db.commit()
-    logger.info("Seeded owner-stated mortgage terms")
+    logger.info("Seeded the owner's stated mortgage terms")
     return True
 
 
@@ -386,9 +387,19 @@ def derive_term_months(principal_cents: int, rate: float, pi_cents: int) -> Opti
 
 
 def _add_months(iso_date: str, months: int) -> str:
+    """Shift an ISO date by whole months, clamping the day to the month's length.
+
+    Without the clamp a loan whose first payment landed on the 31st produced
+    "2025-02-31" — a string that parses as Invalid Date in the browser and blanks
+    the plan line on the chart.
+    """
+    import calendar
+
     y, m, d = (int(x) for x in iso_date.split("-"))
     total = (y * 12 + (m - 1)) + months
-    return f"{total // 12:04d}-{total % 12 + 1:02d}-{d:02d}"
+    year, month = total // 12, total % 12 + 1
+    day = min(d, calendar.monthrange(year, month)[1])
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def plan_schedule(principal_cents: int, rate: float, pi_cents: int,
@@ -556,11 +567,12 @@ async def analyze(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
         rate = facts["annual_rate_bps"] / 10_000.0 / 12.0
         rate_basis = "stated"
 
-    # P&I comes from the stated terms when they are complete — that is the
-    # contract. The lender's schedule is then a check on it, not the source.
+    # P&I: if the owner has stated the loan and the term, that arithmetic IS the
+    # contract and wins. Otherwise it comes off the lender's schedule, which
+    # states the same payment on every row.
     terms_pi = payment_from_terms(stated_principal, rate, stated_term) if rate else None
     pi_cents = terms_pi or schedule_pi
-    pi_basis = "derived" if terms_pi else ("derived" if schedule_pi else "unknown")
+    pi_basis = "derived" if (terms_pi or schedule_pi) else "unknown"
     pi_source = ("the stated terms (loan x rate over the term)" if terms_pi
                  else "the lender's schedule (principal + interest per row)" if schedule_pi
                  else None)
@@ -586,25 +598,34 @@ async def analyze(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
     if coverage:
         warnings.append(coverage)
 
-    # ── what was borrowed: stated by the owner, and re-solved as a check ─────
+    # ── what was borrowed ───────────────────────────────────────────────────
     #
-    # The solve runs whether or not the amount was stated. When it was, the solve
-    # is an independent verification (it reads $279,999.99 against a stated
-    # $280,000); when it was not, it is the only way to know, and the figure is
-    # labelled ``inferred`` instead of ``stated``.
+    # The solve runs whether or not the owner has stated the amount. When they
+    # have, it is an independent verification of their figure; when they have not
+    # — the default — it is the only way to know, and the result is labelled
+    # ``inferred``, never presented as something anyone said.
     solved_cents: Optional[float] = None
     if rate and pi_cents and payments:
         solved_cents = solve_origination_cents(rate, pi_cents, payments)
 
-    original_cents: Optional[int] = None
+    original_cents: Optional[int] = None      # the headline figure
+    balance_basis_cents: Optional[int] = None  # what the arithmetic actually runs on
     original_basis = "unknown"
     inference: Optional[Dict[str, Any]] = None
 
     if stated_principal:
-        original_cents = int(stated_principal)
+        original_cents = balance_basis_cents = int(stated_principal)
         original_basis = "stated"
     elif solved_cents:
         original_cents, how = _snap(solved_cents)
+        # Run the amortization on the SOLVED value, not the rounded headline.
+        # Rounding $279,999.99 up to $280,000 for display is reasonable — no
+        # lender writes the former — but pushing the rounded number through the
+        # arithmetic leaves a few cents that cannot be applied, which then reads
+        # as "still owing" on a loan that is closed. The headline says $280,000,
+        # `inference.solved_cents` says what was actually solved, and the payment
+        # rows add up exactly.
+        balance_basis_cents = int(round(solved_cents))
         original_basis = "inferred"
         inference = {
             "method": (
@@ -640,9 +661,12 @@ async def analyze(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
 
     # ── run the stream ──────────────────────────────────────────────────────
     sim = None
-    if original_cents and rate and pi_cents and payments:
-        sim = _simulate(original_cents, rate, pi_cents, payments, exact=True)
-        if sim["unexplained_cents"]:
+    if balance_basis_cents and rate and pi_cents and payments:
+        sim = _simulate(balance_basis_cents, rate, pi_cents, payments, exact=True)
+        # Always reported in `reconciliation`; only WARNED about when it is more
+        # than rounding. A one-cent artifact of a rate recovered to 8 decimal
+        # places is not something to put in front of a reader.
+        if sim["unexplained_cents"] > 100:
             warnings.append(
                 f"${sim['unexplained_cents']/100:,.2f} of the payments cannot be applied to "
                 f"principal, interest or escrow under these terms. On a payoff that is usually "
@@ -703,21 +727,35 @@ async def analyze(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
     plan_interest: Optional[int] = None
     interest_saved: Optional[int] = None
     months_saved: Optional[int] = None
-    if original_cents and rate and pi_cents:
-        plan_rows = plan_schedule(original_cents, rate, pi_cents,
-                                  facts.get("first_payment_date"))
+    # The plan is anchored on the first payment. Prefer the owner's stated date
+    # (the contractual due date); fall back to the first payment the ledger
+    # actually shows, which is within days of it.
+    plan_anchor = facts.get("first_payment_date") or (
+        payments[0]["posted_date"] if payments else None)
+    if balance_basis_cents and rate and pi_cents:
+        plan_rows = plan_schedule(balance_basis_cents, rate, pi_cents, plan_anchor)
         plan_interest = sum(r["interest_cents"] for r in plan_rows)
         if sim:
             interest_saved = plan_interest - sim["interest_cents"]
             months_saved = max(0, len(plan_rows) - len(scheduled_payments))
 
+    # When the owner has not stated the contractual payoff date, the plan's last
+    # row IS that date — same term, same anchor — so it is derived rather than
+    # missing. Marked as such: it inherits the anchor's precision, no more.
+    if not result_terms["scheduled_payoff_date"] and plan_rows and plan_rows[-1]["date"]:
+        result_terms["scheduled_payoff_date"] = plan_rows[-1]["date"]
+        result_terms["scheduled_payoff_date_basis"] = "derived"
+
     figures = {
         "original_loan": _figure(
             original_cents, original_basis,
-            "Solved from the real payment stream — see `inference`."
-            if original_basis == "inferred" else
-            ("Supplied by you." if original_basis == "stated"
-             else "Not derivable: no lender schedule, so no rate to solve with."),
+            (f"Not stated anywhere, so it was solved from the real payment stream: the only "
+             f"opening balance that closes at $0 on the payoff is ${solved_cents/100:,.2f}, "
+             f"which a lender writes as ${original_cents/100:,.0f}. Enter the figure from your "
+             f"closing documents to replace it."
+             if original_basis == "inferred" and solved_cents else
+             "Supplied by you." if original_basis == "stated"
+             else "Not derivable — no lender schedule, so there is no rate to solve with."),
         ),
         "total_paid_to_lender": _figure(
             total_paid, "measured",
@@ -726,7 +764,12 @@ async def analyze(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
         "principal_paid": _figure(
             sim["principal_cents"] if sim else None,
             "derived" if sim else "unknown",
-            "Equals the original loan when the loan is closed.",
+            ("The whole loan, because it is closed."
+             + ("" if original_basis != "inferred"
+                else " Cents apart from the headline above, which is rounded to what a lender "
+                     "would have written.")
+             if sim and status == "closed" else
+             "Principal applied by the payments so far." if sim else ""),
         ),
         "interest_paid": _figure(
             sim["interest_cents"] if sim else None,

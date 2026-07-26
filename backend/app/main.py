@@ -55,13 +55,14 @@ async def lifespan(app: FastAPI):
         logger.warning("Account meta seed failed: %s", exc)
 
     # Mortgage. Two idempotent steps:
-    #   * seed the owner's stated loan terms into `mortgage_facts` if that table
-    #     has no row yet — the terms are in the closing documents, not in any
-    #     bank export, so they have to be recorded somewhere the user can edit;
-    #   * delete the principal/interest child rows the retired
-    #     `mortgage_splitter` manufactured with a constant $843.01 of interest.
-    #     The split is now derived at read time, so those rows are pure fiction
-    #     sitting in the ledger.
+    #   * seed the loan terms the owner stated (amount, rate, term, first payment,
+    #     purchase price) into `mortgage_facts` if that table has no row yet. They
+    #     live in the closing documents, not in any bank export, so there is
+    #     nowhere else for them to come from — and once the row exists the owner's
+    #     own edits win forever, so this never overwrites a correction;
+    #   * delete the principal/interest child rows the retired `mortgage_splitter`
+    #     manufactured with a constant $843.01 of interest. The split is derived at
+    #     read time now, so those rows are pure fiction sitting in the ledger.
     try:
         from app.database import get_db
         from app.services.mortgage import remove_fabricated_splits, seed_owner_facts

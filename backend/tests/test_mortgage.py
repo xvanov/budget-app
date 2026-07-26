@@ -32,7 +32,9 @@ from app.services.mortgage import (
     solve_origination_cents,
 )
 
-# The owner's loan: $280,000 at 6.49% over 120 months, first payment 2025-04-01.
+# The loan the ledger describes: $280,000 at 6.49% over 120 months, first payment
+# 2025-04-01. These are what the app DERIVES from the real data (and what a
+# fixture-owner would type in); nothing here is shipped as a default.
 TERMS = {
     "original_principal_cents": 28_000_000,
     "annual_rate_bps": 649,
@@ -79,6 +81,10 @@ def _insert(con, posted_date, amount_cents, description, platform, account="chas
 
 
 def _seed_loan(con, *, with_facts=True, with_schedule=True, twins=True):
+    # ``with_facts=True`` models an owner who has typed their closing documents
+    # in, which is what pins the arithmetic to the cent. The product default is
+    # an EMPTY facts table — see
+    # ``test_ships_with_no_stated_facts_and_still_balances``.
     """Every payment written twice — once as CSV history, once as its Plaid twin."""
     platforms = ("chase", "plaid") if twins else ("plaid",)
     ach = f"JPMORGAN CHASE   CHASE ACH                  PPD ID: {LENDER_ACH_ID}"
@@ -162,8 +168,10 @@ def test_scope_all_reports_the_doubling_rather_than_hiding_it(test_client, loan_
     """scope=all deliberately sees both sources; the twin warning must fire."""
     data = test_client.get("/api/mortgage?scope=all").json()
     assert data["figures"]["total_paid_to_lender"]["cents"] == 2 * EXPECTED_TOTAL_PAID
-    # and the derived split cannot balance, which shows up as leftover money
-    assert data["reconciliation"]["unexplained_cents"] > 0
+    # and the derived split cannot balance, which shows up as leftover money and
+    # as a warning the page puts on screen
+    assert data["reconciliation"]["unexplained_cents"] > 100
+    assert any("cannot be applied" in w for w in data["warnings"])
 
 
 # ── (b) no fabricated constant interest anywhere in the output ───────────────
@@ -263,6 +271,44 @@ def test_measured_servicer_credit_outranks_a_stated_refund(test_client, loan_db)
     refund = test_client.get("/api/mortgage").json()["figures"]["escrow_refunded"]
     assert refund["basis"] == "measured"
     assert refund["cents"] == 162_318
+
+
+def test_ships_with_no_stated_facts_and_still_balances(test_client, loan_db):
+    """The default install states NOTHING — nothing is seeded on the owner's behalf.
+
+    This is the shipped path: no facts row, so the rate and payment come off the
+    lender's schedule and the amount borrowed is solved. The money must still
+    account for itself exactly, and the loan must still read as closed. Guards
+    against anyone "helpfully" pre-filling `mortgage_facts` with the app's own
+    inference, which would relabel a derivation as the owner's word.
+    """
+    loan_db.execute("DELETE FROM mortgage_facts")
+    loan_db.commit()
+    data = test_client.get("/api/mortgage").json()
+    f = data["figures"]
+
+    assert all(v is None for k, v in data["facts"].items()), data["facts"]
+    assert f["original_loan"]["basis"] == "inferred"
+    assert f["purchase_price"]["cents"] is None
+    assert f["purchase_price"]["basis"] == "unknown"
+    assert f["down_payment"]["cents"] is None
+    assert data["terms"]["annual_rate_basis"] == "derived"
+
+    assert f["total_paid_to_lender"]["cents"] == EXPECTED_TOTAL_PAID
+    # Every cent still lands somewhere, and nothing is left unapplied — even
+    # though the rate here is recovered from a 3-row slice of the schedule, so
+    # the interest is a couple of dollars off the figure the full schedule gives.
+    assert (f["principal_paid"]["cents"] + f["interest_paid"]["cents"]
+            + f["escrow_paid"]["cents"]) == EXPECTED_TOTAL_PAID
+    assert data["reconciliation"]["unexplained_cents"] == 0
+    assert abs(f["interest_paid"]["cents"] - EXPECTED_INTEREST) < 1_000
+    assert data["status"] == "closed"
+    assert data["payoff_date"] == "2026-07-08"
+    # The term and the contractual payoff date fall out of the derivation.
+    assert data["terms"]["term_months"] == 120
+    assert data["terms"]["term_months_basis"] == "derived"
+    assert data["terms"]["scheduled_payoff_date_basis"] == "derived"
+    assert data["terms"]["scheduled_payoff_date"].startswith("2035-")
 
 
 def test_without_terms_or_schedule_the_split_is_unknown_not_guessed(test_client, loan_db):
@@ -465,3 +511,108 @@ def test_amortization_alias_ignores_inflows_on_the_loan(test_client, loan_db):
     loan_db.commit()
     after = test_client.get("/api/amortization").json()["summary"]["total_paid_cents"]
     assert after == before, "a credit is not money paid to the lender"
+
+
+# ── the owner's stated terms are seeded once, and never overwrite an edit ─────
+# `seed_owner_facts` is the only thing in this module that writes a figure nobody
+# derived. It exists because the amount borrowed, the rate and the term live in
+# closing documents, not in a bank export — the owner supplied them directly. The
+# risk it carries is not the seeding but the RE-seeding: if it ever overwrote the
+# table, a correction typed in the UI would silently revert on the next restart,
+# which is the same class of bug as a deleted category coming back.
+def test_owner_facts_seed_once_then_never_again(test_client, loan_db):
+    from app.services.mortgage import OWNER_STATED_FACTS, load_facts, seed_owner_facts
+
+    def _run(coro):
+        import asyncio
+
+        import aiosqlite
+
+        async def inner():
+            db = await aiosqlite.connect(os.environ["DB_PATH"])
+            db.row_factory = aiosqlite.Row
+            try:
+                return await coro(db)
+            finally:
+                await db.close()
+
+        return asyncio.run(inner())
+
+    # Start from "no facts row" explicitly. The app's own startup seeds during
+    # fixture setup, so relying on the fixture's wipe would make this test depend
+    # on fixture ordering rather than on the behaviour under test.
+    loan_db.execute("DELETE FROM mortgage_facts")
+    loan_db.commit()
+
+    assert _run(seed_owner_facts) is True
+    assert _run(seed_owner_facts) is False
+
+    facts = _run(load_facts)
+    for key, value in OWNER_STATED_FACTS.items():
+        assert facts[key] == value, key
+
+    # An owner correction must survive the next boot.
+    async def _correct(db):
+        from app.services.mortgage import save_facts
+
+        return await save_facts(db, {"original_principal_cents": 27_500_000})
+
+    _run(_correct)
+    assert _run(seed_owner_facts) is False, "seeding again would revert the correction"
+    assert _run(load_facts)["original_principal_cents"] == 27_500_000
+
+    # And a field the owner deliberately CLEARS stays cleared.
+    async def _clear(db):
+        from app.services.mortgage import save_facts
+
+        return await save_facts(db, {"purchase_price_cents": None})
+
+    _run(_clear)
+    assert _run(seed_owner_facts) is False
+    assert _run(load_facts)["purchase_price_cents"] is None
+
+
+def test_stated_terms_make_the_loan_reconcile_exactly(test_client, loan_db):
+    """With the owner's figures the arithmetic closes; nothing is left over.
+
+    Without them the module still solves $279,999.98 from the payment stream and
+    reports it as `inferred`, which leaves a cent unexplained. The point of this
+    test is that a stated fact is used AS the loan amount rather than being
+    quietly re-derived.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    # Explicitly from scratch: `seed_owner_facts` is a no-op when a row exists, so
+    # inheriting one from another test (pytest-randomly shuffles order) would seed
+    # nothing and test nothing.
+    loan_db.execute("DELETE FROM mortgage_facts")
+    loan_db.commit()
+
+    async def _seed():
+        db = await aiosqlite.connect(os.environ["DB_PATH"])
+        db.row_factory = aiosqlite.Row
+        try:
+            from app.services.mortgage import seed_owner_facts
+
+            assert await seed_owner_facts(db) is True
+        finally:
+            await db.close()
+
+    asyncio.run(_seed())
+
+    data = test_client.get("/api/mortgage").json()
+    figures = data["figures"]
+    assert figures["original_loan"]["cents"] == 28_000_000
+    assert figures["original_loan"]["basis"] == "stated"
+    assert figures["final_balance"]["cents"] == 0
+    assert data["reconciliation"]["unexplained_cents"] == 0
+    assert data["reconciliation"]["residual_cents"] == 0
+    # Purchase price is stated too, which is what lets net worth value the house
+    # instead of inventing `max(balance * 2, $300,000)`.
+    assert figures["purchase_price"]["cents"] == 40_000_000
+    assert figures["purchase_price"]["basis"] == "stated"
+    # The escrow refund was deliberately NOT seeded — the owner skipped it.
+    assert figures["escrow_refunded"]["cents"] is None
+    assert figures["escrow_refunded"]["basis"] == "unknown"
