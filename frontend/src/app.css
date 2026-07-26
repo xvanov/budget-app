@@ -143,6 +143,18 @@ button { font-family: inherit; }
 .topbar-period .popover-item.is-active { font-weight: 500; color: var(--foreground); }
 /* The range read-out is the first thing to go when the header gets tight. */
 @media (max-width: 1439px) { .topbar-period > .period-range { display: none; } }
+/* Custom range panel: same popover, month grid instead of a preset list. */
+.topbar-period .period-popover.is-custom { min-width: 300px; }
+.period-custom { display: flex; flex-direction: column; gap: 8px; min-width: 272px; }
+.period-year { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 6px; font-size: 13px; }
+.period-year .iconbtn { font-size: 18px; line-height: 1; }
+.period-year .iconbtn:disabled { opacity: 0.35; cursor: default; }
+.period-months { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; }
+.period-months .seg-item { padding: 6px 0; text-align: center; }
+.period-months .seg-item:disabled { opacity: 0.3; cursor: default; }
+.period-custom .form-input { padding: 6px 8px; }
+.period-custom .msg-banner { padding: 7px 10px; font-size: 12px; }
+.period-custom-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 
 /* ===== Table ===== */
 .tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; }

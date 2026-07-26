@@ -107,8 +107,68 @@ const PERIOD_ROUTES = new Set([
   '/', '/txns', '/income', '/expenses', '/refunded', '/excluded', '/budgets', '/trends',
 ])
 
+// ───── Custom period ranges ─────
+// A custom window is encoded INTO the period id — 'custom:2026-01-01:2026-01-31'
+// — so the period stays one serializable string. Every page already receives
+// `periodId` and calls resolvePeriod(), and that same string is what App()
+// persists to localStorage, so a hand-picked range needs no new props and
+// survives a reload for free.
+const CUSTOM_PERIOD_PREFIX = 'custom:'
+const MIN_PERIOD_YEAR = 1900
+const MAX_PERIOD_YEAR = 2100
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+// 'YYYY-MM-DD' -> local midnight Date, or null if it is not a real date. Parsed
+// by hand because `new Date('2026-01-01')` is UTC (off by a day west of GMT) and
+// `new Date(2026, 1, 31)` silently rolls over into March.
+function parseDateInput(s) {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(s ?? '').trim())
+  if (!m) return null
+  const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3])
+  if (y < MIN_PERIOD_YEAR || y > MAX_PERIOD_YEAR) return null
+  const dt = new Date(y, mo - 1, d)
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null
+  return dt
+}
+
+function customPeriodId(startStr, endStr) { return `${CUSTOM_PERIOD_PREFIX}${startStr}:${endStr}` }
+function monthPeriodId(year, month) {
+  const s = new Date(year, month, 1)
+  return customPeriodId(fmtDateParam(s), fmtDateParam(endOfMonth(s)))
+}
+function yearPeriodId(year) { return customPeriodId(`${year}-01-01`, `${year}-12-31`) }
+
+// The one validator: anything that is not a well-formed, non-inverted range is
+// not a custom period at all, so a corrupt stored id falls back to a preset
+// instead of resolving to a nonsense window.
+function parseCustomPeriod(id) {
+  if (typeof id !== 'string' || !id.startsWith(CUSTOM_PERIOD_PREFIX)) return null
+  const [s, e] = id.slice(CUSTOM_PERIOD_PREFIX.length).split(':')
+  const start = parseDateInput(s)
+  const endDay = parseDateInput(e)
+  if (!start || !endDay || endDay < start) return null
+  return { start, end: new Date(endDay.getFullYear(), endDay.getMonth(), endDay.getDate(), 23, 59, 59) }
+}
+
+// Labels read like the presets': a whole month is 'Jan 2026', a whole year is
+// '2026', anything else is its two endpoints.
+function customPeriodLabel(start, end) {
+  const sameMonth = start.getFullYear() === end.getFullYear() && start.getMonth() === end.getMonth()
+  if (start.getDate() === 1 && sameMonth && end.getDate() === endOfMonth(start).getDate()) return fmtMonth(start)
+  const sameYear = start.getFullYear() === end.getFullYear()
+  if (sameYear && start.getMonth() === 0 && start.getDate() === 1 && end.getMonth() === 11 && end.getDate() === 31)
+    return String(start.getFullYear())
+  return sameYear ? `${fmtDate(start)} – ${fmtDate(end)}` : `${fmtDateLong(start)} – ${fmtDateLong(end)}`
+}
+
+function isPeriodId(id) {
+  return PERIOD_PRESETS.some(p => p.id === id) || parseCustomPeriod(id) != null
+}
+
 function resolvePeriod(id) {
   const now = new Date()
+  const custom = parseCustomPeriod(id)
+  if (custom) return { ...custom, label: customPeriodLabel(custom.start, custom.end), isCustom: true }
   switch (id) {
     case 'this-month': return { start: startOfMonth(now), end: now, label: fmtMonth(now) }
     case 'last-month': { const s = startOfMonth(addMonths(now, -1)); return { start: s, end: endOfMonth(s), label: fmtMonth(s) } }
@@ -166,10 +226,99 @@ function useMediaQuery(query) {
   return matches
 }
 
+// The custom-range picker, shared by both layouts. A month grid comes first
+// because "the month of January" is what people actually ask for; the two date
+// inputs below it are the escape hatch for everything else. Nothing is applied
+// until it parses as a real, non-inverted range.
+function CustomRangePanel({ value, onApply, onBack }) {
+  const today = new Date()
+  const current = parseCustomPeriod(value)
+  const [year, setYear] = useState(() => (current ? current.start.getFullYear() : today.getFullYear()))
+  const [startStr, setStartStr] = useState(() => fmtDateParam(current ? current.start : startOfMonth(today)))
+  const [endStr, setEndStr] = useState(() => fmtDateParam(current ? current.end : today))
+  const [err, setErr] = useState(null)
+
+  const draft = parseCustomPeriod(customPeriodId(startStr, endStr))
+  const minAttr = `${MIN_PERIOD_YEAR}-01-01`
+  const maxAttr = `${MAX_PERIOD_YEAR}-12-31`
+
+  function applyTyped() {
+    if (!startStr || !endStr) { setErr('Pick both a start and an end date.'); return }
+    const s = parseDateInput(startStr)
+    const e = parseDateInput(endStr)
+    if (!s || !e) { setErr(`Use real dates between ${MIN_PERIOD_YEAR} and ${MAX_PERIOD_YEAR}.`); return }
+    if (e < s) { setErr('The end date must be on or after the start date.'); return }
+    setErr(null)
+    onApply(customPeriodId(fmtDateParam(s), fmtDateParam(e)))
+  }
+
+  return (
+    <div className="period-custom" data-testid="period-custom-panel">
+      <div className="popover-section-label">Pick a month</div>
+      <div className="period-year">
+        <button className="iconbtn" aria-label="Previous year" onClick={() => setYear(y => Math.max(MIN_PERIOD_YEAR, y - 1))}>‹</button>
+        <span className="mono" data-testid="period-custom-year">{year}</span>
+        {/* Nothing has happened after this year yet, so offering it would only
+            ever resolve to an empty window. */}
+        <button className="iconbtn" aria-label="Next year" disabled={year >= today.getFullYear()}
+                onClick={() => setYear(y => y + 1)}>›</button>
+      </div>
+      <div className="seg period-months">
+        {MONTH_ABBR.map((m, i) => {
+          const id = monthPeriodId(year, i)
+          const future = new Date(year, i, 1) > today
+          return (
+            <button key={m} className={`seg-item ${value === id ? 'is-active' : ''}`}
+                    disabled={future} data-testid={`period-month-${year}-${String(i + 1).padStart(2, '0')}`}
+                    onClick={() => onApply(id)}>{m}</button>
+          )
+        })}
+      </div>
+      <div className={`popover-item ${value === yearPeriodId(year) ? 'is-active' : ''}`}
+           data-testid="period-custom-full-year" onClick={() => onApply(yearPeriodId(year))}>
+        <Icon name="Calendar" size={14}/> All of {year}
+      </div>
+      <div className="popover-sep"/>
+      <div className="popover-section-label">Or an exact range</div>
+      <div className="form-row">
+        <div className="form-group">
+          <span className="form-label">Start</span>
+          <input className="form-input" type="date" min={minAttr} max={maxAttr} value={startStr}
+                 data-testid="period-custom-start"
+                 onChange={e => { setStartStr(e.target.value); setErr(null) }}/>
+        </div>
+        <div className="form-group">
+          <span className="form-label">End</span>
+          <input className="form-input" type="date" min={minAttr} max={maxAttr} value={endStr}
+                 data-testid="period-custom-end"
+                 onChange={e => { setEndStr(e.target.value); setErr(null) }}/>
+        </div>
+      </div>
+      {err
+        ? <div className="msg-banner err" data-testid="period-custom-error">{err}</div>
+        : draft && (
+            <div className="period-range" data-testid="period-custom-preview">
+              <span className="mono">{fmtDateLong(draft.start)}</span> → <span className="mono">{fmtDateLong(draft.end)}</span>
+            </div>
+          )}
+      <div className="period-custom-foot">
+        <button className="btn btn--ghost btn--sm" data-testid="period-custom-back" onClick={onBack}>
+          ‹ Back to presets
+        </button>
+        <button className="btn btn--primary btn--sm" data-testid="period-custom-apply" onClick={applyTyped}>Apply</button>
+      </div>
+    </div>
+  )
+}
+
 function PeriodControl({ value, onChange }) {
   const period = resolvePeriod(value)
+  const isCustom = !!period.isCustom
   const roomForSegments = useMediaQuery(`(min-width: ${PERIOD_SEG_MIN}px)`)
   const [open, setOpen] = useState(false)
+  // Which face the dropdown is showing. Only used by the compact layout, where
+  // the presets and the custom panel share one popover.
+  const [showCustom, setShowCustom] = useState(false)
   const ref = useRef(null)
 
   useEffect(() => {
@@ -184,6 +333,12 @@ function PeriodControl({ value, onChange }) {
     }
   }, [open])
 
+  function applyCustom(id) {
+    onChange(id)
+    setOpen(false)
+    setShowCustom(false)
+  }
+
   const range = (
     <div className="period-range">
       <span className="mono">{fmtDate(period.start)}</span> → <span className="mono">{fmtDate(period.end)}</span>
@@ -195,20 +350,32 @@ function PeriodControl({ value, onChange }) {
     return (
       <div className="topbar-period is-compact" ref={ref} data-testid="period-control">
         <button className="btn btn--outline btn--sm" aria-expanded={open}
-                onClick={() => setOpen(o => !o)}>
-          <Icon name="Calendar" size={14}/> {active?.label || 'Period'} <Icon name="ChevronDown" size={14}/>
+                onClick={() => { setOpen(o => !o); setShowCustom(false) }}>
+          <Icon name="Calendar" size={14}/> {active?.label || (isCustom ? period.label : 'Period')} <Icon name="ChevronDown" size={14}/>
         </button>
         {open && (
           <div className="popover period-popover">
-            {PERIOD_PRESETS.map(p => (
-              <div key={p.id} className={`popover-item ${value === p.id ? 'is-active' : ''}`}
-                   onClick={() => { onChange(p.id); setOpen(false) }}>
-                {value === p.id ? <Icon name="Check" size={14}/> : <span style={{width:14}}/>}
-                {p.label}
-              </div>
-            ))}
-            <div className="popover-sep"/>
-            <div style={{padding:'2px 10px 4px'}}>{range}</div>
+            {showCustom ? (
+              <CustomRangePanel value={value} onApply={applyCustom} onBack={() => setShowCustom(false)}/>
+            ) : (
+              <>
+                {PERIOD_PRESETS.map(p => (
+                  <div key={p.id} className={`popover-item ${value === p.id ? 'is-active' : ''}`}
+                       onClick={() => { onChange(p.id); setOpen(false) }}>
+                    {value === p.id ? <Icon name="Check" size={14}/> : <span style={{width:14}}/>}
+                    {p.label}
+                  </div>
+                ))}
+                <div className="popover-sep"/>
+                <div className={`popover-item ${isCustom ? 'is-active' : ''}`} data-testid="period-custom-toggle"
+                     onClick={() => setShowCustom(true)}>
+                  {isCustom ? <Icon name="Check" size={14}/> : <span style={{width:14}}/>}
+                  {isCustom ? period.label : 'Custom range…'}
+                </div>
+                <div className="popover-sep"/>
+                <div style={{padding:'2px 10px 4px'}}>{range}</div>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -216,14 +383,26 @@ function PeriodControl({ value, onChange }) {
   }
 
   return (
-    <div className="topbar-period" data-testid="period-control">
+    <div className="topbar-period" ref={ref} data-testid="period-control">
       <Icon name="Calendar" size={14}/>
       <div className="seg">
         {PERIOD_PRESETS.map(p => (
-          <button key={p.id} onClick={() => onChange(p.id)} className={`seg-item ${value === p.id ? 'is-active' : ''}`}>{p.label}</button>
+          <button key={p.id} onClick={() => { onChange(p.id); setOpen(false) }}
+                  className={`seg-item ${value === p.id ? 'is-active' : ''}`}>{p.label}</button>
         ))}
+        {/* Eighth segment: the presets stay visible beside it, so closing the
+            panel is itself the way back to them. */}
+        <button className={`seg-item ${isCustom ? 'is-active' : ''}`} aria-expanded={open}
+                data-testid="period-custom-toggle" onClick={() => setOpen(o => !o)}>
+          {isCustom ? period.label : 'Custom…'}
+        </button>
       </div>
       {range}
+      {open && (
+        <div className="popover period-popover is-custom">
+          <CustomRangePanel value={value} onApply={applyCustom} onBack={() => setOpen(false)}/>
+        </div>
+      )}
     </div>
   )
 }
@@ -880,8 +1059,11 @@ function BudgetsPage({ periodId }) {
     setLoading(true)
     setInsightsLoading(true)
     const period = resolvePeriod(periodId)
-    const ps = period.start.toISOString().slice(0, 10)
-    const pe = period.end.toISOString().slice(0, 10)
+    // fmtDateParam, not toISOString(): the period ends at local 23:59:59, which
+    // in any negative-UTC-offset zone serialises to the NEXT day in UTC — this
+    // page was quietly asking for one extra day of spend.
+    const ps = fmtDateParam(period.start)
+    const pe = fmtDateParam(period.end)
     apiFetch('/budgets/status?period_start=' + ps + '&period_end=' + pe)
       .then(d => { setData(d); setLoading(false) })
       .catch(() => setLoading(false))
@@ -1596,10 +1778,12 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
       .catch(() => {})
   }, [])
 
+  // Clicking the active column always flips it. There used to be a third
+  // "reset to posted_date desc" state, which on the Date column itself was a
+  // no-op — so Date could never be sorted ascending twice, and looked broken.
   function handleSort(col) {
     if (sortCol === col) {
-      if (sortDir === 'asc') setSortDir('desc')
-      else if (sortDir === 'desc') { setSortCol('posted_date'); setSortDir('desc') }
+      setSortDir(d => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortCol(col)
       setSortDir('asc')
@@ -4996,7 +5180,13 @@ export default function App() {
   // Default to year-to-date, which for 2026 resolves to Jan 1 2026 -> today via
   // resolvePeriod(): the window the owner asked the app to focus on. 'All Time'
   // still reaches the pre-2026 CSV history.
-  const [periodId, setPeriodId] = useState(() => localStorage.getItem('budget-period') || 'ytd')
+  // A stored id can also be a custom range ('custom:2026-01-01:2026-01-31');
+  // anything that is neither a preset nor a valid range is stale or corrupt and
+  // falls back rather than resolving to a window nothing in the UI can show.
+  const [periodId, setPeriodId] = useState(() => {
+    const stored = localStorage.getItem('budget-period')
+    return stored && isPeriodId(stored) ? stored : 'ytd'
+  })
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => localStorage.getItem('budget-sidebar-collapsed') === '1')
   const [categoryColors, setCategoryColors] = useState({})
