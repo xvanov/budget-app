@@ -10,6 +10,7 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %
 
 from app.database import init_db, seed_categories, backfill_explainability
 from app.routers import health, import_routes, transactions, accounts, context, transfers, categorize, rules, categories, mortgage, paystubs, budgets, compare, net_worth, trends, anomalies, sankey, chat_correct, amazon, plaid_routes
+from app.services import plaid_scheduler
 from app.services.import_state import import_state
 
 logger = logging.getLogger(__name__)
@@ -85,35 +86,17 @@ async def lifespan(app: FastAPI):
 
     # Periodic Plaid sync — what makes this a live app rather than a CSV viewer.
     # In-process so it needs no host cron; PLAID_SYNC_INTERVAL_MIN=0 disables it.
+    # The schedule itself lives in app.services.plaid_scheduler: it syncs shortly
+    # after boot when the data is already stale, so a restart can no longer reset
+    # the timer and starve the sync (which is exactly what left last_synced_at 14
+    # hours old). See that module for the cadence/cost rationale.
     sync_task = None
-    interval_min = int(os.environ.get("PLAID_SYNC_INTERVAL_MIN", "360") or 0)
+    interval_min = plaid_scheduler.interval_minutes()
     if interval_min > 0 and not os.environ.get("SKIP_AUTO_IMPORT"):
-        async def _plaid_sync_loop():
-            from app.database import get_db
-            from app.services import plaid_client, plaid_sync
-
-            while True:
-                # Sleep first: never fire a sync during boot, when the DB may
-                # still be migrating or importing.
-                await asyncio.sleep(interval_min * 60)
-                if not plaid_client.is_configured():
-                    continue
-                db = await get_db()
-                try:
-                    cursor = await db.execute("SELECT COUNT(*) FROM plaid_items")
-                    row = await cursor.fetchone()
-                    if not (row and row[0]):
-                        continue  # nothing linked yet
-                    result = await plaid_sync.sync_all(db)
-                    logger.info("Scheduled Plaid sync: %s",
-                                {k: v for k, v in result.items() if k != "new_ids"})
-                except Exception as exc:
-                    logger.warning("Scheduled Plaid sync failed: %s", exc)
-                finally:
-                    await db.close()
-
-        sync_task = asyncio.create_task(_plaid_sync_loop())
-        logger.info("Plaid periodic sync enabled every %d minutes", interval_min)
+        sync_task = asyncio.create_task(plaid_scheduler.sync_loop(interval_min))
+        logger.info("Plaid periodic sync enabled every %d minutes (first check %ds after boot)",
+                    interval_min,
+                    min(plaid_scheduler.startup_grace_seconds(), interval_min * 60))
 
     yield
 

@@ -24,7 +24,9 @@ services:
       - BUDGET_CONTEXT_PATH=/data/budget_context.md
       - SAMPLES_DIR=/app/samples
       - AMAZON_DIR=/app/samples/amazon
-      - PLAID_SYNC_INTERVAL_MIN=${PLAID_SYNC_INTERVAL_MIN:-360}
+      # Hourly. Cursor-based /transactions/sync is cheap (~24 calls/day per
+      # linked item, incremental pages are usually empty); 0 disables.
+      - PLAID_SYNC_INTERVAL_MIN=${PLAID_SYNC_INTERVAL_MIN:-60}
       # Optional: account display names and kinds, applied on every boot.
       # Startup derives a name and kind for each account it finds in the data
       # ("Bank 1234", checking/credit), which is enough for a first run but

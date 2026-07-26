@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.services import plaid_client, plaid_sync
+from app.services import plaid_client, plaid_scheduler, plaid_sync
 from app.services.crypto import EncryptionError, decrypt_secret, is_encryption_configured
 from app.services.plaid_client import PlaidConfigError
 
@@ -39,12 +39,18 @@ async def plaid_status():
             except PlaidConfigError:
                 configured = False
         items = await plaid_sync.list_items(db)
+        # The cadence is reported so the UI can say "overdue" honestly instead of
+        # hard-coding a threshold that drifts from the server's schedule.
+        interval_min = plaid_scheduler.interval_minutes()
         return {
             "configured": configured,
             "environment": env,
             "encryption_configured": is_encryption_configured(),
             "items": items,
             "item_count": len(items),
+            "sync_interval_min": interval_min,
+            "auto_sync_enabled": interval_min > 0,
+            "sync_running": plaid_scheduler.sync_in_progress(),
         }
     finally:
         await db.close()
@@ -104,11 +110,20 @@ async def items():
 
 @router.post("/api/plaid/sync")
 async def sync(item_db_id: int = 0, categorize: bool = True):
+    """Manual "Sync now". Shares one process-level lock with the scheduled loop.
+
+    409 rather than queueing: this is a foreground request, and waiting behind an
+    in-flight sync (a first 730-day pull takes minutes) would look like a hang.
+    See plaid_scheduler.sync_guard for the full reasoning.
+    """
     db = await get_db()
     try:
-        if item_db_id:
-            return await plaid_sync.sync_item(db, item_db_id)
-        return await plaid_sync.sync_all(db, categorize=categorize)
+        async with plaid_scheduler.sync_guard():
+            if item_db_id:
+                return await plaid_sync.sync_item(db, item_db_id)
+            return await plaid_sync.sync_all(db, categorize=categorize)
+    except plaid_scheduler.SyncInProgress as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PlaidConfigError as exc:
