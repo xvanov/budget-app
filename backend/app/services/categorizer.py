@@ -93,13 +93,29 @@ def determine_asset_class(category_path: str) -> Optional[str]:
     return None
 
 
-def build_categorization_prompt(transactions: List[Dict[str, Any]]) -> str:
+def build_categorization_prompt(
+    transactions: List[Dict[str, Any]],
+    available_categories: Optional[List[str]] = None,
+) -> str:
+    """Prompt for one batch.
+
+    ``available_categories`` is the user's LIVE category list. It matters that the
+    offered set is live rather than the ``CATEGORY_TREE`` constant: a category the
+    user deleted must not be an option, or the next sync files transactions under
+    it and the deleted name reappears on the expenses page (whose rows come from
+    transaction data, not from the categories table). ``None`` falls back to the
+    shipped defaults, which is only right for a database with no categories yet.
+    """
     ids = [t["id"] for t in transactions]
+    offered = [c for c in (available_categories or []) if c]
+    tree = "\n".join(offered) if offered else CATEGORY_TREE
     lines = [
         "You are categorizing personal finance transactions. Use the category tree below and the ground-truth rules to assign each transaction to the correct category.",
         "",
         "AVAILABLE CATEGORIES (use one of these exact names — they are FLAT, no '>'):",
-        CATEGORY_TREE,
+        tree,
+        "",
+        "Use ONLY a name from that list. It is the user's own current list; a name that is not on it does not exist and will be discarded.",
         "",
         "GROUND-TRUTH RULES:",
         GROUND_TRUTH_RULES,
@@ -141,9 +157,33 @@ async def _db_execute(db, sql: str, params):
             raise
 
 
+async def _live_categories(db) -> List[str]:
+    """The categories to offer the model: everything the user currently has,
+    minus the opt-out bucket.
+
+    ``Excluded`` is the owner's own "do not count this" marker and was never in
+    ``CATEGORY_TREE``; offering it would let the model quietly drop rows out of
+    every total. It stays a user-only destination.
+    """
+    from app.services.flat_categories import EXCLUDED_CATEGORY, live_category_names
+
+    try:
+        names = await live_category_names(db)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not read live category list: %s", exc)
+        return []
+    return [n for n in names if n != EXCLUDED_CATEGORY]
+
+
 async def _categorize_batch(db, batch: List[Dict[str, Any]]) -> int:
     batch_ids = {t["id"] for t in batch}
-    prompt = build_categorization_prompt(batch)
+    available = await _live_categories(db)
+    prompt = build_categorization_prompt(batch, available)
+    # Case-folded name -> canonical name, so a model answering "travel" resolves to
+    # the row the user actually has. Empty when the DB has no categories yet, in
+    # which case the model's answer is taken as-is (the pre-existing behaviour).
+    allowed = {n.casefold(): n for n in available}
+    unknown_fallback = "Other" if "other" in allowed else "Uncategorized"
 
     try:
         response = await asyncio.to_thread(call_llm, prompt)
@@ -201,10 +241,34 @@ async def _categorize_batch(db, batch: List[Dict[str, Any]]) -> int:
             if flattened and flattened != category_path:
                 logger.info("Flattened LLM category '%s' -> '%s'", category_path, flattened)
                 category_path = flattened
+
+            # A name the user does not have is NOT a licence to create it. The
+            # model can propose a category the user deleted (it may even have been
+            # trained on the default list), and writing it onto a transaction is
+            # enough to make the deleted name reappear in every breakdown, which is
+            # built from transaction data. Treat it as no answer at all.
+            reason = r.get("categorization_reason", "")
+            if allowed and category_path and category_path != "Uncategorized":
+                resolved = allowed.get(category_path.strip().casefold())
+                if resolved is None:
+                    logger.info(
+                        "LLM proposed category '%s', which the user does not have — filing as '%s'",
+                        category_path, unknown_fallback,
+                    )
+                    reason = (
+                        f"Proposed category '{category_path}' does not exist "
+                        f"(deleted or never created) — filed as {unknown_fallback}. "
+                        + reason
+                    ).strip()
+                    category_path = unknown_fallback
+                else:
+                    category_path = resolved
+
             # Ignore any entity_type the model offers: the sign decides.
             entity_type = determine_entity_type(category_path, txn.get("amount_cents"))
             confidence = r.get("confidence_score", 0.0)
-            reason = r.get("categorization_reason", "")
+            # `reason` is already set above and may carry the "proposed category
+            # does not exist" note; re-reading it from the response would drop that.
             business_context = r.get("business_context", "personal")
 
             # Sign-invariant: reject LLM assignments where sign and direction

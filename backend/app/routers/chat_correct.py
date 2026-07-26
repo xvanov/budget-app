@@ -15,6 +15,7 @@ from app.services.flat_categories import (
     EXCLUDED_CATEGORY,
     MIGRATION_MAP,
     TRANSFER_CATEGORIES,
+    CategoryDeleted,
     flatten_path,
 )
 from app.services.rules_service import (
@@ -382,12 +383,22 @@ async def chat_correct(req: ChatCorrectRequestExt):
                     context_diff_parts.append(coercion)
                 if search and category_path:
                     # Create the flat category if it's new, so the LLM can route
-                    # transactions to a brand-new bucket in a single action.
+                    # transactions to a brand-new bucket in a single action — unless
+                    # the user DELETED that name, in which case the whole action is
+                    # abandoned. Writing the name onto transactions anyway would put
+                    # the deleted category straight back into every breakdown.
                     try:
                         await ensure_flat_category(db, category_path)
                         context_diff_parts.append(
                             f"Ensured category exists: {category_path}"
                         )
+                    except CategoryDeleted as exc:
+                        logger.info("Refusing chat recategorize into deleted category: %s", exc)
+                        context_diff_parts.append(
+                            f"Skipped: “{category_path}” was deleted. Add it back on the "
+                            f"Expenses or Income tab first if you want to use it again."
+                        )
+                        continue
                     except Exception as exc:  # pragma: no cover - defensive
                         logger.warning(
                             "ensure_flat_category failed for %r: %s",
@@ -487,6 +498,15 @@ async def chat_correct(req: ChatCorrectRequestExt):
                 if pattern and category_path:
                     try:
                         await ensure_flat_category(db, category_path)
+                    except CategoryDeleted as exc:
+                        # A rule into a deleted category is a resurrection machine:
+                        # it would re-stamp the name on every future import.
+                        logger.info("Refusing rule into deleted category: %s", exc)
+                        context_diff_parts.append(
+                            f"Skipped rule: “{category_path}” was deleted. Add it back "
+                            f"first if you want new transactions filed there."
+                        )
+                        continue
                     except Exception as exc:  # pragma: no cover - defensive
                         logger.warning(
                             "ensure_flat_category failed for %r: %s",
@@ -507,7 +527,13 @@ async def chat_correct(req: ChatCorrectRequestExt):
                     context_diff_parts.append(coercion)
                 if category_path:
                     try:
-                        leaf_id = await ensure_flat_category(db, category_path)
+                        # `create_category` IS the explicit request, so it is the one
+                        # action allowed to bring a deleted category back — the same
+                        # licence POST /api/categories has. Deletion is a decision,
+                        # not a permanent ban.
+                        leaf_id = await ensure_flat_category(
+                            db, category_path, allow_revive=True
+                        )
                         context_diff_parts.append(
                             f"Ensured category exists: {category_path} (id={leaf_id})"
                         )

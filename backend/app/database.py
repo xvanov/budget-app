@@ -180,6 +180,34 @@ async def init_db():
                 FOREIGN KEY (parent_id) REFERENCES categories(id)
             );
 
+            -- Categories the owner has DELETED. A tombstone, not a soft delete:
+            -- the `categories` row really goes away (its transactions are
+            -- reassigned first), and this table only records the decision.
+            --
+            -- It exists because `seed_flat_categories` re-INSERTs every name in
+            -- DEFAULT_CATEGORIES on every boot. "Idempotent with respect to the
+            -- defaults" is exactly what resurrected the owner's deletions: Travel
+            -- and Housing came back on the next restart, twice. Every path that
+            -- creates a category behind the user's back — the seed, the chat
+            -- `ensure_flat_category`, an import rule, the categorizer — consults
+            -- this table, so a deletion survives a restart.
+            --
+            -- A soft-delete column on `categories` was the alternative and was
+            -- rejected: every read (`SELECT * FROM categories`, the tree builder,
+            -- /colors, the duplicate-name check, reassign_to validation, and each
+            -- consumer that joins on `path`) would need a new filter, and a single
+            -- missed site shows a category the user deleted. A separate table is
+            -- additive, empty by default, and consulted only where a row is
+            -- CREATED. It also records the intent for a default that was never
+            -- seeded in this database, which no column on a missing row can.
+            --
+            -- NOCASE so "travel" and "Travel" are the same decision, matching the
+            -- case-insensitive duplicate check in POST /api/categories.
+            CREATE TABLE IF NOT EXISTS deleted_categories (
+                name TEXT PRIMARY KEY COLLATE NOCASE,
+                deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS budgets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category_path TEXT NOT NULL,
