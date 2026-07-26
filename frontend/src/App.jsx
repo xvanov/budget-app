@@ -89,6 +89,25 @@ function fmtDateLong(d) { return d.toLocaleDateString('en-US', { month: 'short',
 function fmtMonth(d) { return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) }
 function fmtDateParam(d) { const y = d.getFullYear(); const m = String(d.getMonth() + 1).padStart(2, '0'); const day = String(d.getDate()).padStart(2, '0'); return `${y}-${m}-${day}` }
 
+// Every date the API sends is a plain calendar string ('2026-04' or '2026-04-01')
+// with no timezone, and it means that day where the owner lives. `new Date(str)`
+// on such a string parses it as UTC, which west of Greenwich lands on the
+// PREVIOUS day — so a monthly bucket rendered a month early and a $115,630 income
+// month appeared under the previous month's name. Building the date from its
+// parts keeps it local, which is what the label was always supposed to say.
+function localDateFromISO(iso) {
+  if (!iso) return null
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  if (!y) return null
+  return new Date(y, (m || 1) - 1, d || 1)
+}
+
+function monthStartFromKey(key) {
+  const [y, m] = String(key || '').split('-').map(Number)
+  if (!y) return null
+  return new Date(y, (m || 1) - 1, 1)
+}
+
 const PERIOD_PRESETS = [
   { id: 'this-month', label: 'This Month' },
   { id: 'last-month', label: 'Last Month' },
@@ -342,9 +361,17 @@ function PeriodControl({ value, onChange }) {
     setShowCustom(false)
   }
 
+  // Show the year whenever either end of the range falls outside the current one.
+  // With month+day only, `custom:1996-01-01:2026-12-31` read as "Jan 1 → Dec 31" —
+  // thirty-one years looking exactly like one — and a range in a future year was
+  // indistinguishable from this year's.
+  const thisYear = new Date().getFullYear()
+  const spansOtherYear = period.start.getFullYear() !== thisYear
+    || period.end.getFullYear() !== thisYear
+  const fmtEnd = spansOtherYear ? fmtDateLong : fmtDate
   const range = (
     <div className="period-range">
-      <span className="mono">{fmtDate(period.start)}</span> → <span className="mono">{fmtDate(period.end)}</span>
+      <span className="mono">{fmtEnd(period.start)}</span> → <span className="mono">{fmtEnd(period.end)}</span>
     </div>
   )
 
@@ -1345,7 +1372,7 @@ function BudgetRow({ r }) {
           {r.label || r.category_path}
         </div>
         <div className="budget-period">
-          {r.category_path} · {r.period === "week" ? "Weekly" : r.period === "year" ? "Yearly" : "Monthly"} · {fmtDate(new Date(r.period_start))} → {fmtDate(new Date(r.period_end))}
+          {r.category_path} · {r.period === "week" ? "Weekly" : r.period === "year" ? "Yearly" : "Monthly"} · {fmtDate(localDateFromISO(r.period_start))} → {fmtDate(localDateFromISO(r.period_end))}
         </div>
       </div>
       <div className="budget-amt">
@@ -1636,7 +1663,11 @@ function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSe
         <div className="modal-header">
           <div>
             <div className="modal-title">
-              Apply <CategoryDot color={categoryColors[p.category]}/> {p.category} to {p.count} more?
+              {/* applyCount, not p.count: when the match list is truncated the
+                  default selection is only the rows actually shown, so a title
+                  promising all p.count of them disagreed with both the selection
+                  line and the Apply button. */}
+              Apply <CategoryDot color={categoryColors[p.category]}/> {p.category} to {applyCount} more?
             </div>
             <div className="subtitle" style={{fontSize:12, marginTop:2}}>
               {isProduct ? (
@@ -3163,12 +3194,33 @@ function DiffRow({ row, flow }) {
 }
 
 function PeriodPickerCompact({ value, onChange }) {
+  // A custom range has no preset to highlight, so without this the control looked
+  // like nothing was selected and the first click silently destroyed the range
+  // with no way back to it. Comparing two arbitrary windows is a bigger feature;
+  // what this needs is to REPRESENT the current one honestly and let the user
+  // return to it.
+  const [showCustom, setShowCustom] = useState(false)
+  const custom = parseCustomPeriod(value)
   return (
-    <div className="seg" style={{width:"100%", flexWrap:"wrap"}}>
-      {PERIOD_PRESETS.map(p => (
-        <button key={p.id} className={`seg-item ${value === p.id ? "is-active" : ""}`} onClick={() => onChange(p.id)}>{p.label}</button>
-      ))}
-    </div>
+    <>
+      <div className="seg" style={{width:"100%", flexWrap:"wrap"}}>
+        {PERIOD_PRESETS.map(p => (
+          <button key={p.id} className={`seg-item ${value === p.id ? "is-active" : ""}`} onClick={() => onChange(p.id)}>{p.label}</button>
+        ))}
+        <button className={`seg-item ${custom ? "is-active" : ""}`}
+                onClick={() => setShowCustom(s => !s)}
+                title={custom ? "Change this range" : "Pick an exact range"}>
+          {custom ? customPeriodLabel(custom.start, custom.end) : "Custom…"}
+        </button>
+      </div>
+      {showCustom && (
+        <CustomRangePanel
+          value={value}
+          onApply={id => { onChange(id); setShowCustom(false) }}
+          onBack={() => setShowCustom(false)}
+        />
+      )}
+    </>
   )
 }
 
@@ -3199,7 +3251,11 @@ function TrendsPage({ periodId }) {
   const series = useMemo(() => {
     if (!data?.series) return []
     return data.series.map(s => ({
-      date: new Date(s.period + '-01'),
+      // `new Date('2026-01-01')` parses as UTC, so west of Greenwich it lands on
+      // 2025-12-31 and every bar was labelled one month early — a $115,630 income
+      // month showed up under the previous month's name. Building the date from
+      // its parts keeps it local, which is what the label means.
+      date: monthStartFromKey(s.period),
       income: s.income_cents,
       expense: s.expense_cents,
       cats: s.categories || {},
@@ -3217,7 +3273,7 @@ function TrendsPage({ periodId }) {
 
   const nwHistory = useMemo(() => {
     if (!nwData?.history) return []
-    return nwData.history.map(p => ({ x: new Date(p.date), y: p.value }))
+    return nwData.history.map(p => ({ x: localDateFromISO(p.date), y: p.value }))
   }, [nwData])
 
   if (loading) {
@@ -3491,6 +3547,22 @@ function NetWorthPage() {
         <div className="subtitle">Snapshot across {accts.length} accounts · as of {data.as_of}</div>
       </div>
 
+      {/* Which lines in this total are real balances and which are estimates. An
+          unlinked account has no opening balance anywhere in the data, so its
+          "balance" is only the net of the transactions that happen to have been
+          imported. Saying so is the difference between a figure the owner can
+          rely on and one that merely looks precise. */}
+      {data.balance_confidence?.lines_estimated_from_flows > 0 && (
+        <div className="filter-banner" style={{marginBottom:12}}>
+          <Icon name="AlertTriangle" size={14}/>
+          <span>
+            {data.balance_confidence.note}
+            {' '}Those {data.balance_confidence.lines_estimated_from_flows} account(s) contribute{' '}
+            <span className="mono">{fmtCurrency(data.balance_confidence.estimated_net_cents)}</span> of this total.
+          </span>
+        </div>
+      )}
+
       <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3, 1fr)'}}>
         <KpiCard label="Total Net Worth" value={fmtCurrency(total)}
                  valueClass={total >= 0 ? 'pos' : 'neg'} sparkValues={sparkValues} color="#4ade80"/>
@@ -3509,7 +3581,7 @@ function NetWorthPage() {
           </div>
         </div>
         <div style={{padding:'12px 20px 20px'}}>
-          <AreaChart values={nwHistory.map(p => ({x: new Date(p.date), y: p.value}))} color="#4ade80" height={220}/>
+          <AreaChart values={nwHistory.map(p => ({x: localDateFromISO(p.date), y: p.value}))} color="#4ade80" height={220}/>
         </div>
       </div>
 
@@ -3543,8 +3615,18 @@ function NetWorthPage() {
                     <div className="nw-grouptitle-amt mono">{fmtCurrency(g.total, { compact: true })}</div>
                   </div>
                   {g.accts.map(a => {
-                    let h = 0; for (let i = 0; i < a.id.length; i++) h = (h * 31 + a.id.charCodeAt(i)) | 0
-                    const dpct = ((h % 700) / 100) - 1.5
+                    // There used to be a per-account "% change" here, computed as
+                    // ((hash(a.id) % 700) / 100) - 1.5 — a number derived from the
+                    // LETTERS OF THE ACCOUNT ID, rendered green or red beside a real
+                    // balance. It was deterministic, so it looked like a stable
+                    // measurement rather than noise. No per-account history exists
+                    // to compute a real delta from, so the column is gone rather
+                    // than guessed: /api/net-worth/history is whole-portfolio only.
+                    //
+                    // `balance_basis` takes its place, which is a fact we do have:
+                    // a linked account reports its balance, an unlinked one only
+                    // has the net of whatever transactions were imported.
+                    const estimated = a.balance_basis === 'flow_sum'
                     return (
                       <div className="nw-list-row" key={a.id}>
                         <span className="dot" style={{background: g.color}}/>
@@ -3555,7 +3637,11 @@ function NetWorthPage() {
                             : <div className="nw-list-sub">{a.kind.replace('_', ' ')}</div>}
                         </div>
                         <div className="nw-list-amt mono">{fmtCurrency(a.displayValue, { compact: true })}</div>
-                        <div className={`nw-list-delta ${dpct >= 0 ? 'up' : 'down'}`}>{fmtPct(dpct)}</div>
+                        <div className="nw-list-delta" style={{fontSize:11, color:'var(--muted-foreground)'}}
+                             title={estimated ? (a.balance_note || 'Estimated from imported transactions')
+                                              : 'Balance reported by the bank'}>
+                          {estimated ? 'estimated' : (a.balance_basis === 'plaid' ? 'from bank' : '')}
+                        </div>
                       </div>
                     )
                   })}
@@ -5385,7 +5471,14 @@ function syncFreshness(iso, status, intervalMin = DEFAULT_SYNC_INTERVAL_MIN) {
   if (status && status !== 'ACTIVE') {
     return <span className="chip is-plain is-bad" title="Last successful sync">{label}</span>
   }
-  const interval = intervalMin > 0 ? intervalMin : DEFAULT_SYNC_INTERVAL_MIN
+  // Auto-sync off (interval 0) means nobody promised a cadence, so there is no
+  // such thing as late: grading a manual-only setup against an hourly schedule
+  // produced a red "automatic sync appears to be stopped" next to a KPI reading
+  // "Auto sync: off", which is the app contradicting itself.
+  if (!(intervalMin > 0)) {
+    return <span className="chip is-plain" title="Automatic sync is off — this is the last manual sync">{label}</span>
+  }
+  const interval = intervalMin
   // One missed cycle is normal jitter; two means the scheduler is not running.
   if (mins <= interval * 1.5) return <span className="chip is-plain is-good">{label}</span>
   if (mins <= interval * 3) {
@@ -5451,8 +5544,14 @@ function AccountsPage() {
   }, [])
 
   const loadPlaid = useCallback(() => (
+    // Deliberately does NOT clear `drafts`. It used to, which was survivable when
+    // this only ran on mount and after an explicit action — but the sync poll now
+    // refreshes on every completed sync, so clearing here threw away whatever the
+    // user was typing into a canonical-account-id field, mid-word, with no notice.
+    // A draft is cleared when its own save succeeds (see saveMapping), which is
+    // the only moment the typed value is genuinely stale.
     apiFetch('/plaid/status')
-      .then(d => { setPlaid(d); setPlaidErr(null); setDrafts({}) })
+      .then(d => { setPlaid(d); setPlaidErr(null) })
       .catch(e => setPlaidErr(e.message))
   ), [])
 
@@ -5504,6 +5603,11 @@ function AccountsPage() {
         body: JSON.stringify({ canonical_account_id: value.trim() }),
       })
       addLog('Account mapping saved', { id: acct.id, account_id: value.trim() })
+      // Only now is the typed value stale — the server has it. Clearing just this
+      // account's draft lets the row fall back to the stored value, while any
+      // other field still being edited is left alone.
+      setDrafts(d => { const next = { ...d }; delete next[acct.id]; return next })
+      await loadPlaid()
     } catch (e) { addLog('Mapping failed: ' + e.message) }
   }
 
