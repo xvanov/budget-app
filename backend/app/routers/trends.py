@@ -142,8 +142,10 @@ async def _attach_categories(db, pe, where_clause, params, series):
 async def _net_worth_series(db, start_date, end_date):
     from app.routers.net_worth import _compute_current_balances, _compute_history
 
-    accounts, assets, liabilities, prop_val, mortgage_bal = await _compute_current_balances(db)
-    history = await _compute_history(db, prop_val, mortgage_bal)
+    (accounts, assets, liabilities, prop_val, mortgage_bal,
+     mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
+    history = await _compute_history(db, prop_val, mortgage_bal,
+                                    mortgage_by_month, first_mortgage_month)
 
     if start_date:
         history = [h for h in history if h["date"] >= start_date[:7] + "-01"]
