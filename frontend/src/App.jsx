@@ -1494,20 +1494,33 @@ function CategoryTreeSelect({ nodes, depth, onSelect, currentPath }) {
 }
 
 // ───── Transactions Page ─────
-// The per-item rows a composite charge was split into, shown inline under the
-// parent. The parent itself is neutralised on purpose — its money is carried by
-// these children — so this is the only correct place to categorize a split
-// charge. Making that visible is the fix for people (reasonably) trying to
-// recategorize the parent and getting a refusal they did not expect.
-function SplitChildRows({ parent, catPaths, categoryColors, onChanged }) {
+// The per-item rows a composite charge was split into, plus the combined charge
+// they came from.
+//
+// A fully-split charge is no longer a row of its own in this table: it was on
+// screen twice — once as the combined charge and once as its own items — and the
+// items are the half that carries the real categories. So this block is opened
+// FROM an item row ("part of a $38.15 charge") and shows the whole order: the
+// combined charge for context and every sibling item, each individually
+// categorizable. It still opens from the parent itself in the audit view and for
+// a partially-split charge, which is deliberately still listed.
+//
+// `focusId` is the row the user opened this from, highlighted so a three-item
+// order does not become a guessing game about which line was theirs.
+function SplitChildRows({ parent, catPaths, categoryColors, onChanged, focusId }) {
   const [rows, setRows] = useState(null)
+  const [combined, setCombined] = useState(null)
   const [error, setError] = useState(null)
   const [editing, setEditing] = useState(null)
 
   useEffect(() => {
     let live = true
     apiFetch(`/transactions/${parent.id}/split-items`)
-      .then(d => { if (live) setRows(d.items || []) })
+      .then(d => {
+        if (!live) return
+        setRows(d.items || [])
+        setCombined(d)
+      })
       .catch(e => { if (live) setError(e.message) })
     return () => { live = false }
   }, [parent.id])
@@ -1527,7 +1540,9 @@ function SplitChildRows({ parent, catPaths, categoryColors, onChanged }) {
   }
 
   const childSum = (rows || []).reduce((s, r) => s + (r.amount_cents || 0), 0)
-  const balanced = rows && childSum === parent.amount_cents
+  const parentAmount = combined ? combined.parent_amount_cents : parent.amount_cents
+  const balanced = rows && childSum === parentAmount
+  const itemCount = rows ? rows.length : (parent.split_child_count || 0)
 
   return (
     <tr>
@@ -1536,9 +1551,12 @@ function SplitChildRows({ parent, catPaths, categoryColors, onChanged }) {
         <div style={{borderLeft:'2px solid color-mix(in oklab, var(--primary) 45%, transparent)',
                      paddingLeft:12, marginLeft:2}}>
           <div className="subtitle" style={{fontSize:11, marginBottom:6}}>
-            {parent.split_child_count} item{parent.split_child_count === 1 ? '' : 's'} making up{' '}
-            {fmtCurrency(parent.amount_cents, {full:true})}. Categorize the items — the
-            combined charge above stays out of your totals so nothing counts twice.
+            One charge of {fmtCurrency(parentAmount, {full:true})}
+            {combined?.parent_merchant ? ` from ${combined.parent_merchant}` : ''}
+            {combined?.parent_posted_date ? ` on ${combined.parent_posted_date}` : ''}, split into{' '}
+            {itemCount} item{itemCount === 1 ? '' : 's'}. The items are what your totals
+            count, so categorize them here — the combined charge is kept for the record
+            and counted nowhere.
           </div>
           {error && <div className="msg-banner err">{error}</div>}
           {!rows && <div className="subtitle" style={{fontSize:11}}><Icon name="Loader" size={11}/> Loading items…</div>}
@@ -1546,7 +1564,7 @@ function SplitChildRows({ parent, catPaths, categoryColors, onChanged }) {
             <table className="tbl" style={{fontSize:12}}>
               <tbody>
                 {rows.map(r => (
-                  <tr key={r.id}>
+                  <tr key={r.id} className={r.id === focusId ? 'is-selected' : ''}>
                     <td style={{maxWidth:340, overflow:'hidden', textOverflow:'ellipsis',
                                 whiteSpace:'nowrap'}} title={r.merchant || ''}>
                       {(r.merchant || '').replace(/^Amazon:\s*/, '') || '—'}
@@ -1581,7 +1599,8 @@ function SplitChildRows({ parent, catPaths, categoryColors, onChanged }) {
           {rows && !balanced && (
             <div className="msg-banner err" style={{marginTop:6}}>
               These items total {fmtCurrency(childSum, {full:true})} but the charge is{' '}
-              {fmtCurrency(parent.amount_cents, {full:true})} — the split is unbalanced.
+              {fmtCurrency(parentAmount, {full:true})} — the split is unbalanced, so the
+              combined charge is still listed and still counted for the difference.
             </div>
           )}
         </div>
@@ -1594,11 +1613,23 @@ function SplitChildRows({ parent, catPaths, categoryColors, onChanged }) {
 // The point of this modal is speed with an escape hatch: every match is checked
 // by default so the common answer is one click, but nothing is written until the
 // user confirms and every row can be individually unticked first.
+//
+// Every row must say WHAT it is. For an Amazon product this list used to read as
+// a column of identical "Amazon" rows — 56 of them, checked, of wildly different
+// amounts — which is a confirmation dialog the user cannot actually review. So
+// when the server matched on a product (`matchKind === 'amazon_product'`) the
+// product name is the label, the header names the product rather than the store,
+// and the match reason (Amazon's own product id, or the product name) is stated.
 function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSetApplyAll,
                              onSetCreateRule, onApply, onDismiss }) {
   const p = prompt
   const allChecked = p.matches.length > 0 && p.checked.size === p.matches.length
   const applyCount = p.applyAll ? p.count : p.checked.size
+  const isProduct = p.matchKind === 'amazon_product'
+  const labelOf = (m) => m.product_name || m.merchant || m.description || '—'
+  // A product name runs to 120 characters; a button caption cannot.
+  const shortLabel = (p.matchLabel || '').length > 34
+    ? `${p.matchLabel.slice(0, 34).trim()}…` : p.matchLabel
   return (
     <div className="modal-overlay" onClick={() => !p.applying && onDismiss(false)}>
       <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth:680, width:680}}>
@@ -1608,7 +1639,16 @@ function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSe
               Apply <CategoryDot color={categoryColors[p.category]}/> {p.category} to {p.count} more?
             </div>
             <div className="subtitle" style={{fontSize:12, marginTop:2}}>
-              {p.count} other transaction{p.count === 1 ? '' : 's'} look like <strong>{p.matchLabel}</strong>.
+              {isProduct ? (
+                <>
+                  {p.count} other purchase{p.count === 1 ? '' : 's'} of{' '}
+                  <strong>{p.matchLabel}</strong>
+                  {p.asin ? <> · matched on Amazon product id <span className="mono">{p.asin}</span></>
+                          : <> · matched on the product name</>}
+                </>
+              ) : (
+                <>{p.count} other transaction{p.count === 1 ? '' : 's'} look like <strong>{p.matchLabel}</strong>.</>
+              )}
             </div>
           </div>
           <button className="btn btn--ghost btn--sm" disabled={p.applying} onClick={() => onDismiss(false)}>
@@ -1658,7 +1698,9 @@ function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSe
                     <td className="mono" style={{width:64, whiteSpace:'nowrap', color:'var(--muted-foreground)'}}>
                       {m.posted_date?.slice(5) || ''}
                     </td>
-                    <td>{m.merchant || m.description || '—'}</td>
+                    <td style={{maxWidth:300, overflow:'hidden', textOverflow:'ellipsis',
+                                whiteSpace:'nowrap'}}
+                        title={labelOf(m)}>{labelOf(m)}</td>
                     <td style={{color:'var(--muted-foreground)'}}>
                       <span style={{display:'inline-flex', alignItems:'center'}}>
                         <CategoryDot color={categoryColors[m.category_path]}/>
@@ -1675,12 +1717,23 @@ function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSe
             </table>
           </div>
 
-          <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, cursor:'pointer'}}>
-            <input type="checkbox" checked={p.createRule}
-                   onChange={e => onSetCreateRule(e.target.checked)}
-                   style={{accentColor:'var(--primary)'}}/>
-            Remember this — future imports matching “{p.pattern}” get {p.category} automatically
-          </label>
+          {/* No pattern means no rule can be written that would not also claim
+              unrelated rows on the next import. Offering the checkbox anyway would
+              promise something the server will not do, so the reason is shown
+              instead. */}
+          {p.pattern ? (
+            <label style={{display:'flex', alignItems:'center', gap:6, fontSize:12, cursor:'pointer'}}>
+              <input type="checkbox" checked={p.createRule}
+                     onChange={e => onSetCreateRule(e.target.checked)}
+                     style={{accentColor:'var(--primary)'}}/>
+              Remember this — future imports matching “{p.pattern}” get {p.category} automatically
+            </label>
+          ) : (
+            <div className="subtitle" style={{fontSize:11}}>
+              {p.ruleNote || 'No automatic rule can be saved for this one, so nothing beyond '
+                             + 'the rows above will change.'}
+            </div>
+          )}
         </div>
 
         <div className="modal-foot">
@@ -1688,7 +1741,7 @@ function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSe
                   onClick={() => onDismiss(true)}
                   title={`Stop offering this for ${p.matchLabel} until you reload`}
                   style={{marginRight:'auto'}}>
-            Don’t ask again for {p.matchLabel}
+            Don’t ask again for {shortLabel}
           </button>
           <button className="btn btn--outline" disabled={p.applying} onClick={() => onDismiss(false)}>
             No thanks
@@ -1914,13 +1967,19 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
         category: newCat,
         matchKey: d.match_key,
         matchLabel: d.match_label,
+        // 'merchant' | 'amazon_product' — what the server matched on, which
+        // decides how this list can honestly be described.
+        matchKind: d.match_kind,
+        asin: d.source?.asin || null,
         pattern: d.suggested_pattern,
+        ruleNote: d.rule_note || null,
         count: d.count,
         truncated: !!d.truncated,
         matches: d.matches || [],
         checked: new Set((d.matches || []).map(m => m.id)),
         applyAll: false,
-        createRule: true,
+        // Only offer to remember it when there is a pattern safe enough to store.
+        createRule: !!d.suggested_pattern,
         applying: false,
       })
     } catch (e) {
@@ -1949,8 +2008,11 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
       setSimilarPrompt(null)
       fetchTxns()
       bumpDataVersion()
-      let text = `Applied ${p.category} to ${d.updated_count} more ${p.matchLabel} transaction${d.updated_count === 1 ? '' : 's'}`
+      const what = (p.matchLabel || '').length > 34
+        ? `${p.matchLabel.slice(0, 34).trim()}…` : p.matchLabel
+      let text = `Applied ${p.category} to ${d.updated_count} more ${what} transaction${d.updated_count === 1 ? '' : 's'}`
       if (d.rule_id) text += ' · future imports will match automatically'
+      else if (d.rule_note) text += ' · no automatic rule saved (it would have been too broad)'
       if (d.skipped_count) text += ` · ${d.skipped_count} skipped`
       setBulkMsg({ type: 'ok', text })
     } catch (e) {
@@ -2210,6 +2272,21 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
                           {t.split_child_count} items
                         </span>
                       )}
+                      {/* An item row of a charge that is NOT listed here (the
+                          combined charge is hidden because these items already
+                          account for every cent of it). The chip is how you get
+                          back to it: it shows the order this line came from. */}
+                      {t.split_parent_id && (
+                        <span className="chip is-clickable no-row-select"
+                              title={`One item of a ${fmtCurrency(t.split_parent_amount_cents, {full:true})} `
+                                     + `${t.split_parent_merchant || 'combined'} charge that was split into `
+                                     + `${t.split_sibling_count} items. Click to see the whole charge.`}
+                              onMouseDown={(e) => { e.stopPropagation(); setExpandedSplit(x => x === t.id ? null : t.id) }}
+                              style={{height:18, fontSize:10, padding:'0 6px'}}>
+                          <Icon name={expandedSplit === t.id ? 'ChevronDown' : 'ChevronRight'} size={9}/>{' '}
+                          item of {fmtCurrency(t.split_parent_amount_cents)}
+                        </span>
+                      )}
                       {reclassified[t.id] && (
                         <span className="chip" style={{height:18, fontSize:10, padding:'0 6px'}}><Icon name="Sparkles" size={9}/> reclassified</span>
                       )}
@@ -2220,7 +2297,24 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
                   </td>
                   <td style={{fontSize:12.5, color:"var(--muted-foreground)"}}>{acct?.name || t.account_id || ''}</td>
                   <td className="no-row-select">
-                    {editingCat === t.id ? (
+                    {/* A row with item children cannot legally take a spending
+                        category — its money is already counted through the items,
+                        and the server refuses the write (409). Offering the picker
+                        anyway is a dead end: the user picks a category, waits, and
+                        gets an error. So the affordance leads where the work
+                        actually happens instead — the item rows. */}
+                    {t.split_child_count > 0 ? (
+                      <span className="cell-cat is-editable"
+                            onMouseDown={(e) => { e.stopPropagation(); setExpandedSplit(x => x === t.id ? null : t.id) }}
+                            title={`This is the combined charge; its ${t.split_child_count} item rows carry the categories. Click to open them.`}>
+                        <span style={{fontSize:12, display:'inline-flex', alignItems:'center',
+                                      color:'var(--muted-foreground)'}}>
+                          <CategoryDot color={categoryColors[effectiveCat]}/>
+                          {t.split_child_count} item categories
+                        </span>
+                        <Icon name={expandedSplit === t.id ? 'ChevronDown' : 'ChevronRight'} size={11}/>
+                      </span>
+                    ) : editingCat === t.id ? (
                       <CategoryPicker
                         value={effectiveCat}
                         options={catPaths}
@@ -2266,13 +2360,21 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
                     </button>
                   </td>
                 </tr>
-                {/* The item rows of an expanded split, inline under their parent.
-                    This is where a split charge is actually categorized — the
-                    parent is only the combined total and is deliberately
-                    un-editable, which is confusing until you can see the items. */}
+                {/* The item rows of an expanded split. Opened either from the
+                    combined charge (audit view / partial split) or from one of the
+                    items, which is the normal case now that a fully-covered
+                    combined charge is not listed. */}
                 {expandedSplit === t.id && t.split_child_count > 0 && (
                   <SplitChildRows parent={t} catPaths={catPaths}
                                   categoryColors={categoryColors} onChanged={fetchTxns} />
+                )}
+                {expandedSplit === t.id && !t.split_child_count && t.split_parent_id && (
+                  <SplitChildRows
+                    parent={{ id: t.split_parent_id,
+                              amount_cents: t.split_parent_amount_cents,
+                              split_child_count: t.split_sibling_count }}
+                    focusId={t.id} catPaths={catPaths}
+                    categoryColors={categoryColors} onChanged={fetchTxns} />
                 )}
                 </React.Fragment>
               )

@@ -403,6 +403,12 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(posted_date);
             CREATE INDEX IF NOT EXISTS idx_tx_entity ON transactions(entity_type);
             CREATE INDEX IF NOT EXISTS idx_tx_category ON transactions(category_path);
+            -- Split / pair links. Every "what are this row's children" and "which
+            -- combined charge is this row an item of" question joins the table to
+            -- itself on this column, and the transactions list asks it per row. On
+            -- the live DB (11k rows) a page of 50 took 128 ms without this index and
+            -- 9 ms with it; a 1,000-row page went from 2.1 s to 53 ms.
+            CREATE INDEX IF NOT EXISTS idx_tx_linked ON transactions(linked_transaction_id);
         """)
         await db.commit()
 
