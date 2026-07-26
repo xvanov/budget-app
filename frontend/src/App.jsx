@@ -5230,13 +5230,76 @@ function loadPlaidLink() {
   return plaidLinkPromise
 }
 
-function syncFreshness(iso) {
+// ───── Plaid sync freshness ─────
+// The backend syncs on a schedule (PLAID_SYNC_INTERVAL_MIN, hourly by default)
+// and reports that cadence in /api/plaid/status as sync_interval_min. Judging
+// "overdue" against the server's own cadence keeps this honest: a hard-coded
+// 90-minute threshold said "fine" while a 6-hour schedule was silently dead.
+const SYNC_POLL_MS = 60000            // once a minute, from ONE place — see App()
+const DEFAULT_SYNC_INTERVAL_MIN = 60  // fallback if the server didn't say
+
+function syncAgeMinutes(iso) {
+  if (!iso) return null
+  // last_synced_at is SQLite datetime('now') — UTC with no suffix, so add one.
+  const mins = (Date.now() - new Date(iso.replace(' ', 'T') + 'Z').getTime()) / 60000
+  return Number.isNaN(mins) ? null : Math.max(0, Math.round(mins))
+}
+
+function fmtSyncAge(mins) {
+  if (mins < 60) return `${mins} min ago`
+  const hrs = mins / 60
+  return hrs < 48 ? `${Math.round(hrs)} h ago` : `${Math.round(hrs / 24)} d ago`
+}
+
+// `status` and `intervalMin` are optional so existing callers keep working.
+function syncFreshness(iso, status, intervalMin = DEFAULT_SYNC_INTERVAL_MIN) {
   if (!iso) return <span className="chip is-plain is-warn">never synced</span>
-  const mins = Math.round((Date.now() - new Date(iso + 'Z').getTime()) / 60000)
-  if (Number.isNaN(mins)) return <span className="chip is-plain">{iso}</span>
-  if (mins < 90) return <span className="chip is-plain is-good">{mins} min ago</span>
-  const hrs = Math.round(mins / 60)
-  return <span className={`chip is-plain ${hrs < 30 ? '' : 'is-warn'}`}>{hrs} h ago</span>
+  const mins = syncAgeMinutes(iso)
+  if (mins == null) return <span className="chip is-plain">{iso}</span>
+  const label = fmtSyncAge(mins)
+  // An item in error is not fresh no matter how recent the last success was.
+  if (status && status !== 'ACTIVE') {
+    return <span className="chip is-plain is-bad" title="Last successful sync">{label}</span>
+  }
+  const interval = intervalMin > 0 ? intervalMin : DEFAULT_SYNC_INTERVAL_MIN
+  // One missed cycle is normal jitter; two means the scheduler is not running.
+  if (mins <= interval * 1.5) return <span className="chip is-plain is-good">{label}</span>
+  if (mins <= interval * 3) {
+    return <span className="chip is-plain is-warn" title="A scheduled sync looks late">{label}</span>
+  }
+  return <span className="chip is-plain is-bad" title="Automatic sync appears to be stopped">{label}</span>
+}
+
+// The app's ONLY sync poller. Mounted once, in App() — deliberately not in each
+// page, which would multiply the request rate by however many pages are open.
+// It asks /api/plaid/status once a minute (cheap: one SELECT, no Plaid call) and
+// bumps dataVersion when last_synced_at moves, which is the existing mechanism
+// every data page already re-fetches on. Net effect: a transaction the scheduler
+// pulled — a refund, say — appears within a minute wherever the user is sitting,
+// with no reload and no per-page polling.
+function usePlaidSyncWatch(onSynced) {
+  const seen = useRef(undefined)
+  useEffect(() => {
+    let cancelled = false
+    let timer = null
+    async function poll() {
+      try {
+        const data = await apiFetch('/plaid/status')
+        const latest = (data?.items || [])
+          .map(it => it.last_synced_at || '')
+          .sort()
+          .pop() || ''
+        // First reading establishes the baseline; only a CHANGE is news.
+        if (seen.current !== undefined && latest && latest !== seen.current) onSynced?.(latest)
+        seen.current = latest
+      } catch {
+        // Backend restarting or Plaid unconfigured — keep polling quietly.
+      }
+      if (!cancelled) timer = setTimeout(poll, SYNC_POLL_MS)
+    }
+    poll()
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [onSynced])
 }
 
 function itemStatusChip(status) {
@@ -5245,6 +5308,9 @@ function itemStatusChip(status) {
 }
 
 function AccountsPage() {
+  // dataVersion moves when the sync watcher in App() sees a new last_synced_at,
+  // so this page's freshness row and balances follow an automatic sync too.
+  const { dataVersion } = useContext(AppContext)
   const [plaid, setPlaid] = useState(null)
   const [plaidErr, setPlaidErr] = useState(null)
   const [amazon, setAmazon] = useState(null)
@@ -5272,7 +5338,7 @@ function AccountsPage() {
       .catch(e => setAmazonErr(e.message))
   ), [])
 
-  useEffect(() => { loadPlaid(); loadAmazon() }, [loadPlaid, loadAmazon])
+  useEffect(() => { loadPlaid(); loadAmazon() }, [loadPlaid, loadAmazon, dataVersion])
 
   async function handleConnect() {
     setBusy('connect')
@@ -5350,7 +5416,11 @@ function AccountsPage() {
         <div className="section-head">
           <div>
             <div className="h">Plaid</div>
-            <div className="sub">Link a bank once, then sync to pull transactions</div>
+            <div className="sub">
+              {plaid?.auto_sync_enabled
+                ? `Linked banks sync automatically every ${plaid.sync_interval_min} min — "Sync now" pulls immediately`
+                : 'Link a bank once, then sync to pull transactions'}
+            </div>
           </div>
           <div className="page-intro-actions">
             <button className="btn btn--primary" onClick={handleConnect}
@@ -5364,11 +5434,14 @@ function AccountsPage() {
         </div>
         <div className="card-body">
           {plaidErr ? <div className="msg-banner err">{plaidErr}</div> : (
-            <div className="kpi-grid" style={{gridTemplateColumns:'repeat(4, 1fr)'}}>
+            <div className="kpi-grid" style={{gridTemplateColumns:'repeat(5, 1fr)'}}>
               <KpiCard label="Configured" value={plaid?.configured ? 'yes' : 'no'} color="#38bdf8"/>
               <KpiCard label="Environment" value={plaid?.environment || '—'} color="#a78bfa"/>
               <KpiCard label="Token encryption" value={plaid?.encryption_configured ? 'on' : 'off'} color="#4ade80"/>
               <KpiCard label="Linked items" value={String(plaid?.item_count ?? 0)} color="#facc15"/>
+              <KpiCard label="Auto sync"
+                       value={plaid?.auto_sync_enabled ? `every ${plaid.sync_interval_min} min` : 'off'}
+                       color="#f472b6"/>
             </div>
           )}
 
@@ -5396,7 +5469,7 @@ function AccountsPage() {
                         {itemStatusChip(it.status)}
                         {it.error_code && <span className="chip is-plain is-bad" style={{marginLeft:6}}>{it.error_code}</span>}
                       </td>
-                      <td>{syncFreshness(it.last_synced_at)}</td>
+                      <td>{syncFreshness(it.last_synced_at, it.status, plaid?.sync_interval_min)}</td>
                       <td>
                         <div style={{display:'flex', flexDirection:'column', gap:8}}>
                           {(it.accounts || []).map(a => (
@@ -6050,6 +6123,10 @@ export default function App() {
   // whenever a chat-correct mutates DB rows so every dependent page re-fetches.
   const [dataVersion, setDataVersion] = useState(0)
   const bumpDataVersion = useCallback(() => setDataVersion(v => v + 1), [])
+  // Automatic Plaid sync happens on the server (hourly by default). This is the
+  // single place the browser watches for it: when last_synced_at moves, bump
+  // dataVersion so whatever page is open re-fetches and shows the new rows.
+  usePlaidSyncWatch(bumpDataVersion)
   const appContextValue = useMemo(
     () => ({ dataVersion, bumpDataVersion, categoryColors, palette, reloadColors }),
     [dataVersion, bumpDataVersion, categoryColors, palette, reloadColors]
