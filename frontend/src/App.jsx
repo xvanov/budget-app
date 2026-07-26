@@ -123,7 +123,7 @@ const ROUTE_ALIASES = { '/accounts.html': '/accounts' }
 // Routes whose content is scoped by the global period. Every other route hides
 // the topbar control rather than showing a dial that changes nothing.
 const PERIOD_ROUTES = new Set([
-  '/', '/txns', '/income', '/expenses', '/refunded', '/excluded', '/budgets', '/trends',
+  '/', '/txns', '/income', '/expenses', '/refunded', '/excluded', '/budgets',
   // Merchants slices the same rows by payee, so the time window has to compose
   // with it — that composition is the whole point of the page.
   '/merchants',
@@ -685,6 +685,11 @@ function Dashboard({ periodId, onNavigate }) {
         <TopSpendCard categories={byCategory} period={period} onDrill={handleDrillCategory} />
       </div>
 
+      {/* Net worth. It lived on its own route with no way to navigate to it, so
+          the figures were effectively invisible; the owner asked for them here.
+          Deliberately NOT period-scoped: a balance is as-of-today, not a window. */}
+      <NetWorthSummary />
+
       {drillCategory && drillData && (
         <div className="modal-overlay" onClick={() => setDrillCategory(null)}>
           <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth:800, maxHeight:'80vh', overflow:'auto'}}>
@@ -738,6 +743,88 @@ function Dashboard({ periodId, onNavigate }) {
 // Category type-ahead. Replaces a raw window.prompt() that required typing the
 // full path by hand, '>' separators and all — a category had to be spelled
 // exactly right or the edit silently did nothing useful.
+
+// ───── Net worth, on the Dashboard ─────
+// A balance sheet is not a period report: every figure here is as-of-today, which
+// is why this ignores the global period control rather than pretending to honour
+// it. Linked accounts report a real balance; unlinked ones can only contribute the
+// net of their imported transactions, and `balance_confidence` says which is which
+// so the total is never more precise-looking than it deserves.
+function NetWorthSummary() {
+  const { dataVersion } = useContext(AppContext)
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState(null)
+
+  useEffect(() => {
+    apiFetch('/net-worth')
+      .then(d => { setData(d); setErr(null) })
+      .catch(e => setErr(String(e.message || e)))
+  }, [dataVersion])
+
+  if (err) return null
+  if (!data) return null
+
+  const total = data.total_net_worth_cents || 0
+  const conf = data.balance_confidence || {}
+  const history = (data.history || []).filter(h => h && typeof h.value === 'number')
+  const accounts = (data.accounts || []).slice().sort((a, b) => b.balance - a.balance)
+
+  return (
+    <div className="card">
+      <div className="section-head">
+        <div>
+          <div className="h">Net Worth</div>
+          <div className="sub">
+            As of {data.as_of} · {accounts.length} lines · assets {fmtCurrency(data.assets, {compact:true})} ·
+            liabilities {fmtCurrency(data.liabilities, {compact:true})}
+          </div>
+        </div>
+        <div className={'mono ' + (total >= 0 ? 'amt-pos' : 'amt-neg')} style={{fontSize:20, fontWeight:600}}>
+          {fmtCurrency(total, {compact:true})}
+        </div>
+      </div>
+
+      {conf.lines_estimated_from_flows > 0 && (
+        <div style={{padding:'0 14px 10px', fontSize:12, color:'var(--muted-foreground)'}}>
+          <Icon name="AlertTriangle" size={12}/>{' '}
+          {conf.note} They contribute{' '}
+          <span className="mono">{fmtCurrency(conf.estimated_net_cents)}</span>.
+        </div>
+      )}
+
+      {history.length > 1 && (
+        <div style={{padding:'0 8px'}}>
+          <AreaChart values={history.map(h => ({ x: localDateFromISO(h.date), y: h.value }))}
+                     color="#4ade80" height={160}/>
+        </div>
+      )}
+
+      <div style={{padding:'6px 14px 16px'}}>
+        {accounts.map(a => (
+          <div key={a.id} style={{display:'flex', alignItems:'center', gap:8, padding:'5px 0',
+                                  borderBottom:'1px solid var(--border)'}}>
+            <span style={{flex:1, fontSize:13}}>{a.name}</span>
+            {a.debt != null && (
+              <span style={{fontSize:11, color:'var(--muted-foreground)'}}>
+                loan {fmtCurrency(a.debt, {compact:true})}
+              </span>
+            )}
+            <span style={{fontSize:11, color:'var(--muted-foreground)'}}
+                  title={a.balance_note || (a.balance_basis === 'plaid' ? 'Balance reported by the bank' : '')}>
+              {a.balance_basis === 'flow_sum' ? 'estimated'
+                : a.balance_basis === 'plaid' ? 'from bank'
+                : a.value_basis === 'stated' ? 'stated' : ''}
+            </span>
+            <span className={'mono ' + (a.balance >= 0 ? 'amt-pos' : 'amt-neg')} style={{minWidth:96, textAlign:'right'}}>
+              {fmtCurrency(a.balance, {compact:true})}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function CategoryPicker({ value, options, onPick, onCancel }) {
   const [query, setQuery] = useState('')
   const [highlight, setHighlight] = useState(0)
@@ -3225,508 +3312,6 @@ function PeriodPickerCompact({ value, onChange }) {
 }
 
 // ───── Trends Page ─────
-function TrendsPage({ periodId }) {
-  const { dataVersion } = useContext(AppContext)
-  const [data, setData] = useState(null)
-  const [nwData, setNwData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [mode, setMode] = useState('monthly')
-  const [stackBy, setStackBy] = useState('cat')
-
-  useEffect(() => {
-    setLoading(true)
-    const period = resolvePeriod(periodId)
-    const ps = fmtDateParam(period.start)
-    const pe = fmtDateParam(period.end)
-    Promise.all([
-      apiFetch(`/trends?start_date=${ps}&end_date=${pe}`),
-      apiFetch('/net-worth/history'),
-    ]).then(([td, nw]) => {
-      setData(td)
-      setNwData(nw)
-      setLoading(false)
-    }).catch(() => setLoading(false))
-  }, [periodId, dataVersion])
-
-  const series = useMemo(() => {
-    if (!data?.series) return []
-    return data.series.map(s => ({
-      // `new Date('2026-01-01')` parses as UTC, so west of Greenwich it lands on
-      // 2025-12-31 and every bar was labelled one month early — a $115,630 income
-      // month showed up under the previous month's name. Building the date from
-      // its parts keeps it local, which is what the label means.
-      date: monthStartFromKey(s.period),
-      income: s.income_cents,
-      expense: s.expense_cents,
-      cats: s.categories || {},
-    }))
-  }, [data])
-
-  // Pick top 6 expense categories overall
-  const topCats = useMemo(() => {
-    const m = new Map()
-    for (const b of series) {
-      for (const [k, v] of Object.entries(b.cats)) m.set(k, (m.get(k) || 0) + v)
-    }
-    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k]) => k)
-  }, [series])
-
-  const nwHistory = useMemo(() => {
-    if (!nwData?.history) return []
-    return nwData.history.map(p => ({ x: localDateFromISO(p.date), y: p.value }))
-  }, [nwData])
-
-  if (loading) {
-    return (
-      <div className="page">
-        <div className="subtitle">Loading trends data...</div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="page">
-      <div className="page-intro">
-        <div className="subtitle">Cash flow and spend by category</div>
-      </div>
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Income vs Expense</div>
-            <div className="sub">Monthly totals, net cash flow overlaid</div>
-          </div>
-          <div className="seg">
-            {['monthly', 'quarterly'].map(m => (
-              <button key={m} className={`seg-item ${mode === m ? 'is-active' : ''}`} onClick={() => setMode(m)}>
-                {m[0].toUpperCase() + m.slice(1)}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div style={{padding:'12px 20px 20px'}}>
-          <IncomeExpenseBars series={series}/>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Expense Mix Over Time</div>
-            <div className="sub">Stacked spending by {stackBy === 'cat' ? 'category' : 'subcategory'}</div>
-          </div>
-          <div className="filter-row">
-            <span className="label">Stack by</span>
-            <div className="seg">
-              {['cat', 'sub'].map(s => (
-                <button key={s} className={`seg-item ${stackBy === s ? 'is-active' : ''}`} onClick={() => setStackBy(s)}>
-                  {s === 'cat' ? 'Category' : 'Subcategory'}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-        <div style={{padding:'12px 20px 20px'}}>
-          <StackedBars series={series} keys={topCats} stackBy={stackBy}/>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Net Worth Trajectory</div>
-            <div className="sub">Over time</div>
-          </div>
-        </div>
-        <div style={{padding:'12px 20px 20px'}}>
-          {nwHistory.length > 0
-            ? <AreaChart values={nwHistory} color="#4ade80" height={220}/>
-            : <div className="sub" style={{textAlign:'center', padding:40}}>No net worth history</div>
-          }
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function IncomeExpenseBars({ series }) {
-  const ref = useRef(null)
-  const [w, setW] = useState(900)
-  const [hov, setHov] = useState(null)
-  useEffect(() => {
-    if (!ref.current) return
-    const ro = new ResizeObserver(es => { for (const e of es) setW(e.contentRect.width) })
-    ro.observe(ref.current)
-    return () => ro.disconnect()
-  }, [])
-  const height = 280
-  const pad = { l: 56, r: 16, t: 12, b: 28 }
-  const innerW = w - pad.l - pad.r
-  const innerH = height - pad.t - pad.b
-  const maxV = Math.max(...series.flatMap(s => [s.income, s.expense]), 1)
-  const yMap = v => pad.t + (1 - v / maxV) * innerH
-  const groupW = Math.max(innerW / series.length, 20)
-  const barW = Math.max((groupW - 8) / 2, 4)
-
-  const ticks = 4
-  const yTicks = Array.from({length: ticks + 1}, (_, i) => (maxV * i) / ticks)
-
-  return (
-    <div ref={ref} style={{position:'relative'}}>
-      <svg className="bar-chart" viewBox={`0 0 ${w} ${height}`} height={height}>
-        {yTicks.map((t, i) => (
-          <g key={i}>
-            <line className="chart-grid" x1={pad.l} x2={w - pad.r} y1={yMap(t)} y2={yMap(t)}/>
-            <text className="chart-label" x={pad.l - 8} y={yMap(t)} textAnchor="end" dominantBaseline="central">{fmtCurrency(t, {compact:true})}</text>
-          </g>
-        ))}
-        {series.map((s, i) => {
-          const gx = pad.l + i * groupW + 4
-          const incH = Math.max(1, innerH - yMap(s.income) + pad.t)
-          const expH = Math.max(1, innerH - yMap(s.expense) + pad.t)
-          return (
-            <g key={i} onMouseEnter={() => setHov({ i })} onMouseLeave={() => setHov(null)}>
-              <rect x={gx} y={yMap(s.income)} width={barW} height={incH} fill="#22c55e" rx={2}/>
-              <rect x={gx + barW + 4} y={yMap(s.expense)} width={barW} height={expH} fill="#f43f5e" rx={2}/>
-              <text className="chart-label" x={gx + barW + 2} y={pad.t + innerH + 18} textAnchor="middle">{fmtMonth(s.date).split(" ")[0]}</text>
-            </g>
-          )
-        })}
-        <path
-          d={series.map((s, i) => {
-            const x = pad.l + i * groupW + groupW / 2
-            const y = yMap(s.income - s.expense)
-            return (i === 0 ? "M" : "L") + x.toFixed(1) + "," + y.toFixed(1)
-          }).join(" ")}
-          fill="none" stroke="#a78bfa" strokeWidth={2}/>
-        {series.map((s, i) => (
-          <circle key={i} cx={pad.l + i * groupW + groupW / 2} cy={yMap(s.income - s.expense)} r={3} fill="#a78bfa" stroke="var(--card)" strokeWidth={1.5}/>
-        ))}
-      </svg>
-      <div style={{display:'flex', gap:14, fontSize:12, color:'var(--muted-foreground)', padding:'4px 0 0 56px', flexWrap:'wrap'}}>
-        <span style={{whiteSpace:'nowrap'}}><span className="swatch" style={{background:'#22c55e'}}/> Income</span>
-        <span style={{whiteSpace:'nowrap'}}><span className="swatch" style={{background:'#f43f5e'}}/> Expense</span>
-        <span style={{whiteSpace:'nowrap'}}><span className="swatch" style={{background:'#a78bfa', borderRadius:9999}}/> Net</span>
-      </div>
-    </div>
-  )
-}
-
-function StackedBars({ series, keys, stackBy }) {
-  const ref = useRef(null)
-  const [w, setW] = useState(900)
-  useEffect(() => {
-    if (!ref.current) return
-    const ro = new ResizeObserver(es => { for (const e of es) setW(e.contentRect.width) })
-    ro.observe(ref.current)
-    return () => ro.disconnect()
-  }, [])
-  const height = 280
-  const pad = { l: 56, r: 16, t: 12, b: 28 }
-  const innerW = w - pad.l - pad.r
-  const innerH = height - pad.t - pad.b
-  const maxV = Math.max(...series.map(s => Object.values(s.cats).reduce((a, b) => a + b, 0)), 1)
-  const yMap = v => pad.t + (1 - v / maxV) * innerH
-  const groupW = Math.max(innerW / series.length, 20)
-  const barW = Math.max(groupW - 6, 4)
-
-  const catColors = ['#a78bfa', '#f472b6', '#34d399', '#fbbf24', '#60a5fa', '#fb923c', '#94a3b8']
-
-  const ticks = 4
-  const yTicks = Array.from({length: ticks + 1}, (_, i) => (maxV * i) / ticks)
-
-  return (
-    <div ref={ref} style={{position:'relative'}}>
-      <svg className="bar-chart" viewBox={`0 0 ${w} ${height}`} height={height}>
-        {yTicks.map((t, i) => (
-          <g key={i}>
-            <line className="chart-grid" x1={pad.l} x2={w - pad.r} y1={yMap(t)} y2={yMap(t)}/>
-            <text className="chart-label" x={pad.l - 8} y={yMap(t)} textAnchor="end" dominantBaseline="central">{fmtCurrency(t, {compact:true})}</text>
-          </g>
-        ))}
-        {series.map((s, i) => {
-          const gx = pad.l + i * groupW + 3
-          let yCursor = pad.t + innerH
-          const cats = Object.entries(s.cats).sort((a, b) => b[1] - a[1])
-          return (
-            <g key={i}>
-              {cats.map(([k, v], j) => {
-                const h = Math.max(1, (v / maxV) * innerH)
-                yCursor -= h
-                const colorIdx = keys.indexOf(k)
-                const color = colorIdx >= 0 ? catColors[colorIdx % catColors.length] : '#94a3b8'
-                return (
-                  <rect key={k} x={gx} y={yCursor} width={barW} height={h}
-                        fill={color} opacity={keys.includes(k) ? 1 : 0.5} style={{cursor:'pointer'}}>
-                    <title>{k.split(' > ').pop()}: {fmtCurrency(v)}</title>
-                  </rect>
-                )
-              })}
-              <text className="chart-label" x={gx + barW / 2} y={pad.t + innerH + 18} textAnchor="middle">{fmtMonth(s.date).split(" ")[0]}</text>
-            </g>
-          )
-        })}
-      </svg>
-      <div style={{display:'flex', gap:14, fontSize:12, color:'var(--muted-foreground)', padding:'4px 0 0 56px', flexWrap:'wrap'}}>
-        {keys.map((k, i) => (
-          <span key={k} style={{cursor:'pointer', whiteSpace:'nowrap'}}>
-            <span className="swatch" style={{background: catColors[i % catColors.length]}}/> {k.split(' > ').pop()}
-          </span>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-// ───── Net Worth Page ─────
-function NetWorthPage() {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    setLoading(true)
-    apiFetch('/net-worth')
-      .then(d => { setData(d); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [])
-
-  if (loading) {
-    return (
-      <div className="page">
-        <div className="subtitle">Loading net worth data...</div>
-      </div>
-    )
-  }
-
-  if (!data) {
-    return (
-      <div className="page">
-        <div className="subtitle">No data available</div>
-      </div>
-    )
-  }
-
-  const accts = data.accounts || []
-  const history = data.history || []
-  const assets = data.assets || 0
-  const liabilities = data.liabilities || 0
-  const total = data.total_net_worth_cents || 0
-
-  const groups = {
-    cash: { label: 'Cash & Checking', accts: [], total: 0, color: '#38bdf8' },
-    savings: { label: 'Savings', accts: [], total: 0, color: '#22d3ee' },
-    brokerage: { label: 'Brokerage', accts: [], total: 0, color: '#a78bfa' },
-    retirement: { label: 'Retirement', accts: [], total: 0, color: '#c4b5fd' },
-    real_estate: { label: 'Real Estate', accts: [], total: 0, color: '#10b981' },
-    credit: { label: 'Credit Cards', accts: [], total: 0, color: '#f43f5e' },
-  }
-
-  let computedAssets = 0, computedLiabilities = 0
-  for (const a of accts) {
-    const g = groups[a.kind] || groups.cash
-    let val = a.balance
-    if (a.kind === 'real_estate') {
-      val = a.balance - (a.debt || 0)
-      computedLiabilities += (a.debt || 0)
-      computedAssets += a.balance
-    } else if (a.kind === 'credit') {
-      computedLiabilities += Math.abs(a.balance)
-    } else {
-      computedAssets += a.balance
-    }
-    g.accts.push({ ...a, displayValue: val })
-    g.total += val
-  }
-
-  const nwHistory = history.length > 0 ? history : []
-  const sparkValues = nwHistory.map(p => p.value)
-
-  return (
-    <div className="page">
-      <div className="page-intro">
-        <div className="subtitle">Snapshot across {accts.length} accounts · as of {data.as_of}</div>
-      </div>
-
-      {/* Which lines in this total are real balances and which are estimates. An
-          unlinked account has no opening balance anywhere in the data, so its
-          "balance" is only the net of the transactions that happen to have been
-          imported. Saying so is the difference between a figure the owner can
-          rely on and one that merely looks precise. */}
-      {data.balance_confidence?.lines_estimated_from_flows > 0 && (
-        <div className="filter-banner" style={{marginBottom:12}}>
-          <Icon name="AlertTriangle" size={14}/>
-          <span>
-            {data.balance_confidence.note}
-            {' '}Those {data.balance_confidence.lines_estimated_from_flows} account(s) contribute{' '}
-            <span className="mono">{fmtCurrency(data.balance_confidence.estimated_net_cents)}</span> of this total.
-          </span>
-        </div>
-      )}
-
-      <div className="kpi-grid" style={{gridTemplateColumns:'repeat(3, 1fr)'}}>
-        <KpiCard label="Total Net Worth" value={fmtCurrency(total)}
-                 valueClass={total >= 0 ? 'pos' : 'neg'} sparkValues={sparkValues} color="#4ade80"/>
-        <KpiCard label="Assets" value={fmtCurrency(assets)}
-                 sub={<span>Across {Object.keys(groups).filter(k => groups[k].accts.length > 0).length} categories</span>} color="#a78bfa"/>
-        <KpiCard label="Liabilities" value={fmtCurrency(liabilities)}
-                 sub={<span><Icon name="CircleAlert" size={12}/> {liabilities > 0 ? 'Debt across accounts' : 'No outstanding debt'}</span>}
-                 color="#f43f5e"/>
-      </div>
-
-      <div className="card">
-        <div className="section-head">
-          <div>
-            <div className="h">Net Worth Over Time</div>
-            <div className="sub">{nwHistory.length} months of history</div>
-          </div>
-        </div>
-        <div style={{padding:'12px 20px 20px'}}>
-          <AreaChart values={nwHistory.map(p => ({x: localDateFromISO(p.date), y: p.value}))} color="#4ade80" height={220}/>
-        </div>
-      </div>
-
-      <div className="nw-grid">
-        <div className="card">
-          <div className="section-head">
-            <div>
-              <div className="h">Allocation</div>
-              <div className="sub">Where the wealth lives</div>
-            </div>
-          </div>
-          <Treemap groups={groups} total={computedAssets}/>
-        </div>
-
-        <div className="card">
-          <div className="section-head">
-            <div>
-              <div className="h">Accounts</div>
-              <div className="sub">{accts.length} accounts across all groups</div>
-            </div>
-          </div>
-          <div className="nw-list">
-            {Object.entries(groups).map(([gid, g]) => (
-              g.accts.length > 0 && (
-                <React.Fragment key={gid}>
-                  <div className="nw-grouptitle">
-                    <div style={{display:'flex', alignItems:'center', gap:8}}>
-                      <span className="swatch" style={{background: g.color}}/>
-                      <span className="nw-grouptitle-name">{g.label}</span>
-                    </div>
-                    <div className="nw-grouptitle-amt mono">{fmtCurrency(g.total, { compact: true })}</div>
-                  </div>
-                  {g.accts.map(a => {
-                    // There used to be a per-account "% change" here, computed as
-                    // ((hash(a.id) % 700) / 100) - 1.5 — a number derived from the
-                    // LETTERS OF THE ACCOUNT ID, rendered green or red beside a real
-                    // balance. It was deterministic, so it looked like a stable
-                    // measurement rather than noise. No per-account history exists
-                    // to compute a real delta from, so the column is gone rather
-                    // than guessed: /api/net-worth/history is whole-portfolio only.
-                    //
-                    // `balance_basis` takes its place, which is a fact we do have:
-                    // a linked account reports its balance, an unlinked one only
-                    // has the net of whatever transactions were imported.
-                    const estimated = a.balance_basis === 'flow_sum'
-                    return (
-                      <div className="nw-list-row" key={a.id}>
-                        <span className="dot" style={{background: g.color}}/>
-                        <div>
-                          <div className="nw-list-name">{a.name}</div>
-                          {a.debt != null
-                            ? <div className="nw-list-sub">Value {fmtCurrency(a.balance, {compact:true})} · Loan {fmtCurrency(a.debt, {compact:true})}</div>
-                            : <div className="nw-list-sub">{a.kind.replace('_', ' ')}</div>}
-                        </div>
-                        <div className="nw-list-amt mono">{fmtCurrency(a.displayValue, { compact: true })}</div>
-                        <div className="nw-list-delta" style={{fontSize:11, color:'var(--muted-foreground)'}}
-                             title={estimated ? (a.balance_note || 'Estimated from imported transactions')
-                                              : 'Balance reported by the bank'}>
-                          {estimated ? 'estimated' : (a.balance_basis === 'plaid' ? 'from bank' : '')}
-                        </div>
-                      </div>
-                    )
-                  })}
-                </React.Fragment>
-              )
-            ))}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function Treemap({ groups, total }) {
-  const ref = useRef(null)
-  const [w, setW] = useState(560)
-  useEffect(() => {
-    if (!ref.current) return
-    const ro = new ResizeObserver(es => { for (const e of es) setW(e.contentRect.width) })
-    ro.observe(ref.current)
-    return () => ro.disconnect()
-  }, [])
-  const h = 360
-
-  const items = useMemo(() => {
-    const rows = []
-    for (const [, g] of Object.entries(groups)) {
-      for (const a of g.accts) {
-        if (a.displayValue > 0) rows.push({ id: a.id, name: a.name, value: a.displayValue, color: g.color, group: g.label })
-      }
-    }
-    rows.sort((a, b) => b.value - a.value)
-    return rows
-  }, [groups])
-
-  const layout = useMemo(() => slice_and_dice(items, w, h), [items, w, h])
-
-  return (
-    <div ref={ref} style={{padding:'4px 20px 20px'}}>
-      <svg className="nw-treemap" viewBox={`0 0 ${w} ${h}`} height={h}>
-        {layout.map(r => (
-          <g key={r.id}>
-            <rect className="nw-tile" x={r.x} y={r.y} width={r.w} height={r.h} fill={r.color}/>
-            {r.w > 70 && r.h > 30 && (
-              <>
-                <text className="nw-tile-label" x={r.x + 8} y={r.y + 18}>{r.name}</text>
-                <text className="nw-tile-value" x={r.x + 8} y={r.y + 32}>{fmtCurrency(r.value, {compact:true})}</text>
-              </>
-            )}
-          </g>
-        ))}
-      </svg>
-    </div>
-  )
-}
-
-function slice_and_dice(items, W, H) {
-  const total = items.reduce((s, it) => s + it.value, 0)
-  const out = []
-  function rec(arr, x, y, w, h) {
-    const sum = arr.reduce((s, it) => s + it.value, 0)
-    if (arr.length === 1) { out.push({ ...arr[0], x, y, w, h }); return }
-    const horizontal = w > h
-    const len = horizontal ? w : h
-    let acc = 0, k = 0
-    for (; k < arr.length - 1; k++) {
-      acc += arr[k].value
-      if (acc >= sum * 0.5) { k++; break }
-    }
-    if (k === 0) k = 1
-    const left = arr.slice(0, k), right = arr.slice(k)
-    const leftSum = left.reduce((s, it) => s + it.value, 0)
-    const split = (leftSum / sum) * len
-    if (horizontal) {
-      rec(left, x, y, split, h)
-      rec(right, x + split, y, w - split, h)
-    } else {
-      rec(left, x, y, w, split)
-      rec(right, x, y + split, w, h - split)
-    }
-  }
-  rec(items, 0, 0, W, H)
-  return out
-}
-
 function AreaChart({ values, color = 'var(--primary)', height = 200 }) {
   const ref = useRef(null)
   const [w, setW] = useState(800)
@@ -6404,12 +5989,11 @@ export default function App() {
     { id: '/refunded', label: 'Refunded', icon: 'Repeat' },
     { id: '/excluded', label: 'Excluded', icon: 'X' },
     { id: '/mortgage', label: 'Mortgage', icon: 'Building' },
-    { id: '/activity', label: 'Activity', icon: 'Activity' },
+    { id: '/insights', label: 'Insights', icon: 'Activity' },
     // Net Worth is retired from the nav (owner directive, 2026-07-24): its
     // figures were persistently wrong and the app is scoped to expenditures.
     // The route and its API remain so old links and tests don't break.
     { id: '/compare', label: 'Compare', icon: 'GitMerge' },
-    { id: '/trends', label: 'Trends', icon: 'TrendingUp' },
     { id: '/budgets', label: 'Budgets', icon: 'Target' },
     // Label matches the page title ('Budget Context'); the nav used to say just
     // 'Context' while the page called itself something else.
@@ -6446,10 +6030,6 @@ export default function App() {
       pageTitle = 'Mortgage'
       pageContent = <MortgagePage />
       break
-    case '/networth':
-      pageTitle = 'Net Worth'
-      pageContent = <NetWorthPage />
-      break
     case '/budgets':
       pageTitle = 'Budgets'
       pageContent = <BudgetsPage periodId={periodId} />
@@ -6482,12 +6062,14 @@ export default function App() {
       pageTitle = 'Compare'
       pageContent = <ComparePage periodId={periodId} />
       break
-    case '/trends':
-      pageTitle = 'Trends'
-      pageContent = <TrendsPage periodId={periodId} />
       break
+    // Renamed from '/activity': the page is the anomaly detector's findings —
+    // stalled subscriptions, spending spikes, suspected fraud, duplicates — and
+    // "Activity" told the owner none of that. The old route id is still accepted
+    // so a stored localStorage route keeps working.
     case '/activity':
-      pageTitle = 'Activity'
+    case '/insights':
+      pageTitle = 'Insights'
       pageContent = <ActivityPage />
       break
     case '/chat':

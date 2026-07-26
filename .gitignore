@@ -37,3 +37,6 @@ docker-compose.override.yml
 .DS_Store
 *.swp
 .venv/
+
+# Agent worktrees created by Claude Code sessions — never part of the project.
+.claude/

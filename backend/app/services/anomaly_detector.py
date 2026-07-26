@@ -49,26 +49,52 @@ async def _recurring_subscriptions(db) -> list[dict]:
     Returns per-transaction anomalies with consecutive_month_count and
     price_change_history.
     """
+    # Categories are FLAT now ('Subscriptions'), not hierarchical
+    # ('Expense > Personal > Subscriptions'). This query still asked for the
+    # hierarchical form, which matches nothing — so subscription detection
+    # silently returned zero findings against 233 real Subscriptions rows, and the
+    # Insights tab kept showing the groups it had found before the migration. The
+    # legacy prefix is still accepted so a database that predates the migration
+    # keeps working.
     cursor = await db.execute("""
         SELECT id, merchant, posted_date, amount_cents
         FROM transactions
-        WHERE category_path LIKE 'Expense > Personal > Subscriptions%'
+        WHERE (category_path = 'Subscriptions'
+               OR category_path LIKE 'Expense > Personal > Subscriptions%')
           AND amount_cents < 0
-          AND entity_type != 'transfer'
+          AND (entity_type IS NULL OR entity_type != 'transfer')
         ORDER BY merchant, posted_date
     """)
     rows = await cursor.fetchall()
 
+    # Group by merchant FAMILY, not by the raw string. Keying on raw text split one
+    # subscription into several findings — "NETFLIX" and "NETFLIX.COM" were two,
+    # and "PLANET FITNESS M IClub Fees PPD ID: G710602737" was separate from
+    # "Planet Fitness". That is not just untidy: each fragment has fewer distinct
+    # months, so a genuine long-running subscription can fall under the 6-month bar
+    # and disappear entirely.
+    #
+    # `group_by_merchant` is the same normaliser the Merchants page uses — payee
+    # cut, then dominant-spelling consolidation — so a subscription is identified
+    # here exactly as it is identified there, and it picks the readable label.
+    from app.services.merchant_rollup import group_by_merchant
+
+    families, _assignment = group_by_merchant(
+        [{"id": r["id"], "merchant": r["merchant"], "description": None,
+          "posted_date": r["posted_date"], "amount_cents": r["amount_cents"]}
+         for r in rows]
+    )
+
     merchants: dict = {}
-    for r in rows:
-        key = (r["merchant"] or "").strip().lower()
-        if not key:
-            continue
-        if key not in merchants:
-            merchants[key] = {"label": r["merchant"], "ids": [], "months": set(), "amounts": []}
-        merchants[key]["ids"].append(r["id"])
-        merchants[key]["months"].add(r["posted_date"][:7])
-        merchants[key]["amounts"].append(abs(r["amount_cents"]))
+    for anchor, family in families.items():
+        if not anchor:
+            continue  # a charge that names no payee cannot be audited as a subscription
+        merchants[anchor] = {
+            "label": family["label"],
+            "ids": [r["id"] for r in family["rows"]],
+            "months": {r["posted_date"][:7] for r in family["rows"] if r["posted_date"]},
+            "amounts": [abs(r["amount_cents"]) for r in family["rows"]],
+        }
 
     anomalies = []
     for key, info in merchants.items():
@@ -130,14 +156,23 @@ async def _spending_spikes(db) -> list[dict]:
     max_date = row["max_date"]
     current_start = max_date[:8] + "01"
 
-    cursor = await db.execute("""
+    # "Spending categories" used to mean `category_path LIKE 'Expense%'`, which in
+    # the flat model matches exactly one row in the live DB — so spike detection
+    # was dead. A flat spending category is anything that is not a transfer, not
+    # Excluded and not Uncategorized; that set is defined in one place.
+    from app.services.flat_categories import EXCLUDED_CATEGORY, TRANSFER_CATEGORIES
+
+    non_spending = [*TRANSFER_CATEGORIES, EXCLUDED_CATEGORY, "Uncategorized"]
+    placeholders = ",".join("?" * len(non_spending))
+    cursor = await db.execute(f"""
         SELECT DISTINCT category_path
         FROM transactions
-        WHERE category_path LIKE 'Expense%'
+        WHERE category_path IS NOT NULL
+          AND category_path NOT IN ({placeholders})
           AND amount_cents < 0
-          AND entity_type != 'transfer'
+          AND (entity_type IS NULL OR entity_type != 'transfer')
           AND posted_date >= ?
-    """, (current_start,))
+    """, (*non_spending, current_start))
     active_cats = [r["category_path"] for r in await cursor.fetchall()]
 
     current_parts = current_start.split("-")
@@ -153,23 +188,23 @@ async def _spending_spikes(db) -> list[dict]:
         cursor = await db.execute("""
             SELECT COALESCE(SUM(ABS(amount_cents)), 0)
             FROM transactions
-            WHERE category_path LIKE ?
+            WHERE category_path = ?
               AND amount_cents < 0
-              AND entity_type != 'transfer'
+              AND (entity_type IS NULL OR entity_type != 'transfer')
               AND posted_date >= ?
               AND posted_date < ?
-        """, (cat + "%", trail_start, current_start))
+        """, (cat, trail_start, current_start))
         trail_spend = (await cursor.fetchone())[0] or 0
         trailing_avg = trail_spend / 6.0
 
         cursor = await db.execute("""
             SELECT COALESCE(SUM(ABS(amount_cents)), 0)
             FROM transactions
-            WHERE category_path LIKE ?
+            WHERE category_path = ?
               AND amount_cents < 0
-              AND entity_type != 'transfer'
+              AND (entity_type IS NULL OR entity_type != 'transfer')
               AND posted_date >= ?
-        """, (cat + "%", current_start))
+        """, (cat, current_start))
         current_spend = (await cursor.fetchone())[0] or 0
 
         if trailing_avg <= 0 or current_spend < 5000:
@@ -180,12 +215,12 @@ async def _spending_spikes(db) -> list[dict]:
         multiple = current_spend / max(trailing_avg, 1)
         cursor = await db.execute("""
             SELECT id FROM transactions
-            WHERE category_path LIKE ?
+            WHERE category_path = ?
               AND amount_cents < 0
-              AND entity_type != 'transfer'
+              AND (entity_type IS NULL OR entity_type != 'transfer')
               AND posted_date >= ?
             ORDER BY posted_date DESC
-        """, (cat + "%", current_start))
+        """, (cat, current_start))
         txn_ids = [r["id"] for r in await cursor.fetchall()]
 
         for txn_id in txn_ids:

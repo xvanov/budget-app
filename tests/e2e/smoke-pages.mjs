@@ -15,8 +15,8 @@ const BASE = process.env.BASE_URL || 'http://127.0.0.1:8083';
 // Every nav destination. Accounts & Sync used to be a standalone /accounts.html
 // page; it is a normal in-app route now.
 const ROUTES = ['/', '/txns', '/income', '/expenses', '/merchants', '/refunded', '/excluded', '/mortgage',
-                '/activity', '/compare',
-                '/trends', '/budgets', '/context', '/chat', '/networth', '/accounts'];
+                '/insights', '/compare',
+                '/budgets', '/context', '/chat', '/accounts'];
 
 const browser = await chromium.launch();
 const page = await browser.newPage();
