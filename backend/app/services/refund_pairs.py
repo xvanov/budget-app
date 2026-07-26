@@ -299,6 +299,76 @@ async def reconcile_merchant(db, pattern: str, scope: Optional[str] = "plaid",
     return result
 
 
+
+async def _pair_amazon_attributed_refunds(db, scope_sql: str) -> int:
+    """Pair refunds the AMAZON EXPORT has already attributed to a purchase.
+
+    Amazon tells us, per refund, which order and which item it reverses — and the
+    matcher has already resolved that item to the transaction row that paid for it.
+    That is authoritative, and strictly better than the amount-and-date heuristic
+    in ``find_pairs``, which cannot see it: the credit row is a bare "Amazon" while
+    the purchase was renamed "Amazon: <product>", so their merchant keys differ and
+    a 15-day gap sits on the edge of the window.
+
+    Left unpaired, both halves counted in their own months — 38 transactions and
+    $3,146.52 on the live data, e.g. a $163.38 hydrangea tree bought 2026-04-30 and
+    returned 2026-05-15 made April overstate spending by $163.38 and May show
+    $163.38 of income that was never earned.
+
+    Only fills gaps: a row already paired (by ``find_pairs`` above, or by a vendor
+    reconciliation) is left exactly as it is. Runs after the heuristic pass for that
+    reason.
+    """
+    cursor = await db.execute(
+        f"""SELECT ar.matched_transaction_id AS credit_id,
+                   COALESCE(ai.split_transaction_id, ai.matched_transaction_id) AS charge_id,
+                   credit.amount_cents AS credit_cents,
+                   charge.amount_cents AS charge_cents
+            FROM amazon_refunds ar
+            JOIN amazon_items ai ON ai.id = ar.matched_item_id
+            JOIN transactions credit ON credit.id = ar.matched_transaction_id
+            JOIN transactions charge
+              ON charge.id = COALESCE(ai.split_transaction_id, ai.matched_transaction_id)
+            WHERE ar.matched_transaction_id IS NOT NULL
+              AND credit.refund_match_id IS NULL
+              AND charge.refund_match_id IS NULL
+              AND credit.amount_cents > 0
+              AND charge.amount_cents < 0
+              AND credit.id != charge.id
+              AND credit.id IN (SELECT id FROM transactions t WHERE 1=1 {scope_sql})
+              AND charge.id IN (SELECT id FROM transactions t WHERE 1=1 {scope_sql})"""
+    )
+    candidates = [dict(r) for r in await cursor.fetchall()]
+
+    marked = 0
+    claimed: set = set()
+    for row in candidates:
+        credit_id, charge_id = row["credit_id"], row["charge_id"]
+        # One row belongs to one pair. Two refunds naming the same purchase is a
+        # partial-return case the heuristic pass handles better than this does.
+        if credit_id in claimed or charge_id in claimed:
+            continue
+        credit_cents = int(row["credit_cents"] or 0)
+        charge_cents = abs(int(row["charge_cents"] or 0))
+        if credit_cents > charge_cents:
+            continue  # more back than was paid: not this purchase
+        partial = 1 if credit_cents < charge_cents else 0
+        await db.execute(
+            "UPDATE transactions SET refund_match_id=?, refund_role='charge', refund_partial=? WHERE id=?",
+            (credit_id, partial, charge_id),
+        )
+        await db.execute(
+            "UPDATE transactions SET refund_match_id=?, refund_role='credit', refund_partial=? WHERE id=?",
+            (charge_id, partial, credit_id),
+        )
+        claimed.update({credit_id, charge_id})
+        marked += 1
+
+    if marked:
+        logger.info("Paired %d Amazon-attributed refund(s) the heuristic pass missed", marked)
+    return marked
+
+
 async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
     """Re-detect refund pairs and record them on both transactions."""
     from app.services.scope import resolve_scope
@@ -351,6 +421,8 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
             "UPDATE transactions SET refund_match_id=?, refund_role='credit', refund_partial=? WHERE id=?",
             (pair["charge_id"], 1 if pair["partial"] else 0, pair["credit_id"]),
         )
+
+    amazon_pairs = await _pair_amazon_attributed_refunds(db, scope_sql)
     await db.commit()
 
     full = sum(1 for p in pairs if not p["partial"])
@@ -360,6 +432,7 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
         "full_refunds": full,
         "partial_refunds": len(pairs) - full,
         "refunded_value_cents": sum(p["credit_cents"] for p in pairs),
+        "amazon_attributed_pairs": amazon_pairs,
     }
 
     # Re-apply every vendor reconciliation the owner has done. The wipe above is
