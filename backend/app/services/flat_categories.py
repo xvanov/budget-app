@@ -214,15 +214,120 @@ def entity_type_for(category: Optional[str], amount_cents: int) -> str:
     return "income" if int(amount_cents or 0) > 0 else "expense"
 
 
+# ── Deletion tombstones ──────────────────────────────────────────────────────
+# A deleted category is recorded in `deleted_categories` (see database.py for why
+# a tombstone table rather than a soft-delete column). Everything below is the
+# only interface to it; nothing else should touch the table directly.
+
+
+class CategoryDeleted(ValueError):
+    """Raised when a caller tries to re-create a category the user deleted.
+
+    A ValueError subclass because every existing ``ensure_*`` caller already
+    catches ValueError for a malformed name, so a deleted name degrades the same
+    way — the caller falls back instead of 500-ing.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(
+            f"Category {name!r} was deleted by the user; refusing to re-create it "
+            f"implicitly. Create it explicitly via POST /api/categories to bring it back."
+        )
+
+
+def _norm(name: Optional[str]) -> str:
+    return (name or "").strip().casefold()
+
+
+async def deleted_category_names(db) -> set:
+    """Case-folded names the user has deleted. Empty set if the table predates this."""
+    try:
+        cursor = await db.execute("SELECT name FROM deleted_categories")
+    except Exception:  # table not created yet (a DB built by an older init_db)
+        return set()
+    return {_norm(r[0]) for r in await cursor.fetchall()}
+
+
+async def is_category_deleted(db, name: Optional[str]) -> bool:
+    key = _norm(name)
+    if not key:
+        return False
+    return key in await deleted_category_names(db)
+
+
+async def tombstone_category(db, name: Optional[str]) -> None:
+    """Record that the user deleted ``name``. Idempotent. Does not commit."""
+    value = (name or "").strip()
+    if not value:
+        return
+    try:
+        await db.execute(
+            "INSERT INTO deleted_categories (name) VALUES (?) "
+            "ON CONFLICT(name) DO UPDATE SET deleted_at=datetime('now')",
+            (value,),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not tombstone category %r: %s", value, exc)
+
+
+async def clear_category_tombstone(db, name: Optional[str]) -> None:
+    """Forget that ``name`` was deleted, because the user just re-created it.
+
+    Deletion is a decision, not a permanent ban: an explicit
+    ``POST /api/categories`` (or an explicit ``create_category`` chat action) must
+    bring a category back. Does not commit.
+    """
+    value = (name or "").strip()
+    if not value:
+        return
+    try:
+        await db.execute("DELETE FROM deleted_categories WHERE name=?", (value,))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not clear tombstone for category %r: %s", value, exc)
+
+
+async def live_category_names(db) -> List[str]:
+    """Flat category names that exist RIGHT NOW, in display order.
+
+    The categorizer's prompt is built from this rather than a constant, so the
+    model is only ever offered categories the user still has. A name the user
+    deleted is not an option, which is what stops categorization from putting the
+    deleted name back on the expenses page through the transaction data.
+    """
+    cursor = await db.execute(
+        "SELECT path FROM categories WHERE path NOT LIKE '% > %' ORDER BY sort_order, id"
+    )
+    seen = []
+    for row in await cursor.fetchall():
+        name = (row[0] or "").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 async def seed_flat_categories(db) -> Dict[str, int]:
-    """Insert the default flat categories. Idempotent; never deletes."""
+    """Insert the default flat categories.
+
+    Idempotent, never deletes, and — the part that took a bug to learn —
+    never re-creates a default the user deleted. Re-inserting every name in
+    ``DEFAULT_CATEGORIES`` on each boot made the seed idempotent with respect to
+    the defaults while being actively destructive with respect to the user's
+    intent: Travel and Housing reappeared on every restart no matter how often
+    they were deleted.
+    """
     cursor = await db.execute("SELECT path FROM categories")
     existing = {r[0] for r in await cursor.fetchall()}
+    tombstoned = await deleted_category_names(db)
     cursor = await db.execute("SELECT color FROM categories WHERE color IS NOT NULL")
     used = [r[0] for r in await cursor.fetchall()]
     added = 0
+    skipped_deleted = 0
     for index, name in enumerate(DEFAULT_CATEGORIES):
         if name in existing:
+            continue
+        if _norm(name) in tombstoned:
+            skipped_deleted += 1
             continue
         color = CATEGORY_PALETTE[index % len(CATEGORY_PALETTE)]
         await db.execute(
@@ -239,7 +344,16 @@ async def seed_flat_categories(db) -> Dict[str, int]:
         await db.execute("UPDATE categories SET color=? WHERE id=?", (color, row[0]))
         used.append(color)
     await db.commit()
-    return {"added": added, "total_defaults": len(DEFAULT_CATEGORIES)}
+    if skipped_deleted:
+        logger.info(
+            "Flat category seed: %d default(s) not re-created because the user deleted them",
+            skipped_deleted,
+        )
+    return {
+        "added": added,
+        "skipped_deleted": skipped_deleted,
+        "total_defaults": len(DEFAULT_CATEGORIES),
+    }
 
 
 async def migrate_to_flat(db) -> Dict[str, object]:
@@ -253,6 +367,7 @@ async def migrate_to_flat(db) -> Dict[str, object]:
     # hierarchical path ending in one of them keeps its meaning.
     cursor = await db.execute("SELECT path FROM categories WHERE path NOT LIKE '% > %'")
     known = {r[0] for r in await cursor.fetchall()}
+    tombstoned = await deleted_category_names(db)
 
     cursor = await db.execute(
         "SELECT DISTINCT category_path FROM transactions WHERE category_path IS NOT NULL"
@@ -263,6 +378,15 @@ async def migrate_to_flat(db) -> Dict[str, object]:
     updated_rows = 0
     for path in paths:
         flat = flatten_path(path, known)
+        # MIGRATION_MAP hard-codes default names as destinations, so a legacy
+        # path could land on a category the user has since deleted and put it
+        # back into the ledger. "Other" always exists in the defaults and is the
+        # honest answer for "we no longer have the bucket this belonged to".
+        if flat and _norm(flat) in tombstoned:
+            logger.info(
+                "Legacy path %r maps to deleted category %r — filing as 'Other'", path, flat
+            )
+            flat = "Other" if "Other" in known else None
         if flat == path:
             continue
         remapped[path] = flat

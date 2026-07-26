@@ -37,6 +37,13 @@ async def ensure_category_path(db, path: str) -> int:
     parts = [p for p in parts if p]
     if not parts:
         raise ValueError(f"ensure_category_path: no segments in {path!r}")
+    # A deleted category must not come back through the hierarchical door either.
+    from app.services.flat_categories import CategoryDeleted, deleted_category_names
+
+    tombstoned = await deleted_category_names(db)
+    for part in (path.strip(), *parts):
+        if part.strip().casefold() in tombstoned:
+            raise CategoryDeleted(part.strip())
     parent_id: Optional[int] = None
     current_path = ""
     leaf_id: Optional[int] = None
@@ -67,7 +74,7 @@ async def ensure_category_path(db, path: str) -> int:
     return leaf_id  # type: ignore[return-value]
 
 
-async def ensure_flat_category(db, name: str) -> int:
+async def ensure_flat_category(db, name: str, *, allow_revive: bool = False) -> int:
     """Idempotently ensure a single FLAT category named ``name`` exists.
 
     The flat model has no hierarchy, so there is exactly one row per category:
@@ -79,7 +86,17 @@ async def ensure_flat_category(db, name: str) -> int:
 
     Returns the category id. Colour comes from the same least-used-palette
     picker every other insert uses, so a new category is distinct on day one.
+
+    ``allow_revive`` is the difference between "the user asked for this category"
+    and "something decided a category should exist". A name the user has DELETED
+    raises ``CategoryDeleted`` unless the caller is acting on an explicit
+    create request — otherwise a single chat correction or an LLM-proposed name
+    silently undoes a deletion, which is the bug this guard exists for.
     """
+    from app.services.flat_categories import (
+        CategoryDeleted, clear_category_tombstone, is_category_deleted,
+    )
+
     flat = (name or "").strip()
     if not flat:
         raise ValueError("ensure_flat_category: empty name")
@@ -93,6 +110,10 @@ async def ensure_flat_category(db, name: str) -> int:
     row = await cursor.fetchone()
     if row:
         return row[0]
+    if await is_category_deleted(db, flat):
+        if not allow_revive:
+            raise CategoryDeleted(flat)
+        await clear_category_tombstone(db, flat)
     cursor = await db.execute(
         "INSERT INTO categories (name, parent_id, path, color) VALUES (?, NULL, ?, ?)",
         (flat, flat, await _next_color(db)),
@@ -264,6 +285,15 @@ async def create_category(cat: CategoryCreate):
                 status_code=409, detail=f"A category named '{new_path}' already exists",
             )
 
+        # An explicit create is the user changing their mind, so it clears the
+        # deletion tombstone. Deletion is a decision, not a permanent ban: adding
+        # "Travel" back has to work, and the seed must stop skipping it.
+        from app.services.flat_categories import clear_category_tombstone
+
+        await clear_category_tombstone(db, new_path)
+        if new_path != name:
+            await clear_category_tombstone(db, name)
+
         cursor = await db.execute(
             "INSERT INTO categories (name, parent_id, path, color) VALUES (?, ?, ?, ?)",
             (name, cat.parent_id, new_path, await _next_color(db)),
@@ -315,6 +345,14 @@ async def update_category(cat_id: int, update: CategoryUpdate):
         else:
             new_path = existing["path"]
 
+        # Renaming ONTO a previously deleted name is also an explicit request for
+        # that name to exist again, so it clears the tombstone. The old name is not
+        # tombstoned in return — a rename is not a deletion.
+        from app.services.flat_categories import clear_category_tombstone
+
+        await clear_category_tombstone(db, new_path)
+        await clear_category_tombstone(db, new_name)
+
         await db.execute(
             "UPDATE categories SET name=?, parent_id=?, path=? WHERE id=?",
             (new_name, new_parent_id, new_path, cat_id),
@@ -360,7 +398,14 @@ async def delete_category(cat_id: int, reassign_to: str = "", force: bool = Fals
       * ``force=true`` sets them to Uncategorized instead.
       * With neither, the request is refused and reports how many transactions
         (and child categories) are in the way.
+
+    The deletion is recorded in ``deleted_categories`` so it survives a restart.
+    Without that, ``seed_flat_categories`` re-inserted every default on the next
+    boot and the category came back — the user deleted Travel and Housing twice
+    each before this was fixed.
     """
+    from app.services.flat_categories import tombstone_category
+
     db = await get_db()
     try:
         cursor = await db.execute("SELECT * FROM categories WHERE id=?", (cat_id,))
@@ -442,6 +487,25 @@ async def delete_category(cat_id: int, reassign_to: str = "", force: bool = Fals
 
         for child in sorted(subtree, key=lambda c: -len(c["path"])):
             await db.execute("DELETE FROM categories WHERE id=?", (child["id"],))
+
+        # Tombstone exactly the paths removed — no more. Deleting a legacy
+        # `Expense > Housing` node must NOT suppress the flat `Housing` category;
+        # they are different rows and only one of them was deleted.
+        for child in subtree:
+            await tombstone_category(db, child["path"])
+
+        # Rules are the other resurrection mechanism, and the quieter one: a rule
+        # pointing at a deleted category keeps writing that name onto every future
+        # import, so the category reappears in the expenses/income breakdown (which
+        # is built from transaction data) even with no row in `categories`. The rule
+        # rows are deliberately NOT deleted — that would destroy a user decision the
+        # delete dialog never mentioned — they are just skipped by `apply_rules`
+        # while the tombstone stands, and come back to life if the category does.
+        cursor = await db.execute(
+            f"SELECT COUNT(*) FROM rules WHERE category_path IN ({placeholders})", paths
+        )
+        rules_suspended = (await cursor.fetchone())[0]
+
         await db.commit()
 
         return {
@@ -449,6 +513,8 @@ async def delete_category(cat_id: int, reassign_to: str = "", force: bool = Fals
             "categories_removed": len(subtree),
             "transactions_moved": moved,
             "moved_to": reassign_to or ("Uncategorized" if in_use else None),
+            "tombstoned": True,
+            "rules_suspended": rules_suspended,
         }
     finally:
         await db.close()

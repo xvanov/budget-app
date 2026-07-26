@@ -143,6 +143,7 @@ async def apply_rules(db) -> int:
     The sign-invariant is consulted before each write so a rule that would
     place a positive-amount row into an Expense bucket is skipped.
     """
+    from app.services.flat_categories import deleted_category_names
     from app.services.sign_invariant import (
         coerce_sign_safe,
         log_violation_autofix,
@@ -154,8 +155,22 @@ async def apply_rules(db) -> int:
     if not rules:
         return 0
 
+    # A rule outlives the category it points at, and that is how a deleted
+    # category comes back: the rule keeps stamping the deleted name onto every
+    # matching row of every future import, and the expenses/income breakdown —
+    # built from transaction data, not from the categories table — shows it again.
+    # The rule row is kept (deleting it would throw away a user decision the
+    # delete dialog never mentioned); it is suspended while the tombstone stands
+    # and resumes if the user re-creates the category.
+    tombstoned = await deleted_category_names(db)
+
     total = 0
     for rule in rules:
+        if (rule["category_path"] or "").strip().casefold() in tombstoned:
+            logger.info(
+                "Skipping rule #%s: its category was deleted by the user", rule["id"]
+            )
+            continue
         pattern = rule["pattern"].lower()
         cursor = await db.execute(
             """SELECT id, amount_cents, business_context FROM transactions

@@ -3526,6 +3526,10 @@ function CategoryManager({ onChanged }) {
   const [editName, setEditName] = useState('')
   const [confirming, setConfirming] = useState(null)
   const [moveTo, setMoveTo] = useState('')
+  // A failed delete has to be visible WHERE the user is looking. The generic
+  // `msg` banner renders in the card behind the modal, so a rejected delete used
+  // to look like nothing happened at all.
+  const [delErr, setDelErr] = useState(null)
   const { categoryColors, palette, reloadColors } = useContext(AppContext)
   const [coloring, setColoring] = useState(null)
 
@@ -3585,17 +3589,28 @@ function CategoryManager({ onChanged }) {
   }
 
   async function remove(path) {
-    setBusy(true); setMsg(null)
+    setBusy(true); setMsg(null); setDelErr(null)
     try {
       const all = await apiFetch('/categories')
       const cat = (all.categories || []).find(c => c.path === path)
+      if (!cat) throw new Error(`“${path}” is no longer in the category list — reloading.`)
       const params = new URLSearchParams()
       if (moveTo) params.set('reassign_to', moveTo)
       else params.set('force', 'true')
       const r = await apiFetch(`/categories/${cat.id}?${params}`, { method: 'DELETE' })
-      setConfirming(null); setMoveTo(''); load(); onChanged?.()
-      setMsg({ ok: true, text: `Deleted “${path}”${r.transactions_moved ? ` — ${r.transactions_moved} transactions moved to ${r.moved_to}` : ''}` })
-    } catch (e) { setMsg({ ok: false, text: String(e.message || e) }) }
+      setConfirming(null); setMoveTo(''); onChanged?.()
+      setMsg({ ok: true, text: `Deleted “${path}”`
+        + (r.transactions_moved ? ` — ${r.transactions_moved} transactions moved to ${r.moved_to}` : '')
+        + (r.rules_suspended ? ` — ${r.rules_suspended} rule(s) that filed into it are paused` : '') })
+    } catch (e) {
+      // Keep the modal open and the chip in place: a category that is still on
+      // the server must still be on screen, or the next refresh "brings it back"
+      // and looks like the bug this whole change is about.
+      setDelErr(String(e.message || e))
+    }
+    // Always re-read the server's list — on success it confirms the row is gone,
+    // on failure it confirms it is still there.
+    load()
     setBusy(false)
   }
 
@@ -3654,7 +3669,7 @@ function CategoryManager({ onChanged }) {
                   <Icon name="Tag" size={12}/>
                 </button>
                 <button className="why-btn" title="Delete"
-                        onClick={() => { setConfirming(path); setMoveTo('') }}>
+                        onClick={() => { setConfirming(path); setMoveTo(''); setDelErr(null) }}>
                   <Icon name="X" size={12}/>
                 </button>
               </>
@@ -3698,6 +3713,11 @@ function CategoryManager({ onChanged }) {
                   {cats.filter(c => c !== confirming).map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
+              {delErr && (
+                <div style={{marginTop:10, fontSize:12.5, color:'var(--destructive)'}}>
+                  Not deleted — {delErr}
+                </div>
+              )}
             </div>
             <div className="modal-foot">
               <button className="btn btn--outline" onClick={() => setConfirming(null)}>Cancel</button>
