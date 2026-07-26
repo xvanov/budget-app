@@ -263,11 +263,16 @@ async def test_similar_finds_siblings_and_applies_every_exclusion(test_client):
     assert all(m["strength"] in ("exact", "strong") for m in data["matches"])
     # posted_date DESC.
     assert [m["posted_date"] for m in data["matches"]] == ["2026-05-04", "2026-05-03", "2026-05-02"]
-    # The row shape the frontend is built against.
+    # The row shape the frontend is built against. ``product_name`` labels a match
+    # that was made on an Amazon PRODUCT rather than a merchant; on this path there
+    # is no product, and it must be null rather than a merchant string standing in
+    # for one.
     assert set(data["matches"][0]) == {
         "id", "posted_date", "merchant", "description", "amount_cents",
-        "account_id", "category_path", "strength",
+        "account_id", "category_path", "strength", "product_name",
     }
+    assert data["match_kind"] == "merchant"
+    assert all(m["product_name"] is None for m in data["matches"])
 
 
 @pytest.mark.asyncio

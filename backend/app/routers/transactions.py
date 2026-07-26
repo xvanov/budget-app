@@ -89,6 +89,7 @@ async def get_transactions(
     exclude_refunded: Optional[bool] = False,
     only_refunded: Optional[bool] = False,
     flow: Optional[str] = None,
+    include_split_parents: bool = False,
 ):
     db = await get_db()
     try:
@@ -215,6 +216,26 @@ async def get_transactions(
             clauses.append("ABS(amount_cents) <= ?")
             params.append(int(amount_max * 100))
 
+        # A fully-split charge is on screen TWICE today: once as the original
+        # combined row and once as the item rows it was broken into. The user hit
+        # this on txn 8759 — a −$38.15 Amazon charge listed next to its own three
+        # car-part items — and there is no reading of that list under which the
+        # $38.15 appears once. The items carry the real categories, so they are
+        # the visible truth and the combined row drops out of the listing, its
+        # count and its money totals alike (all three share this WHERE).
+        #
+        # The row is NOT deleted: it is the bank's actual charge and the anchor
+        # for reconciliation, refund pairing and the Amazon item export. It stays
+        # reachable two ways — ``?include_split_parents=true`` for an audit view,
+        # and the ``split_parent_*`` columns below, which let every item row show
+        # and expand the combined charge it belongs to.
+        #
+        # Only FULLY-covered parents are hidden. A partial split would leave
+        # residual money with nowhere to be counted, so those stay listed; see
+        # ``_FULLY_SPLIT_PARENT_IDS_SQL``.
+        if not include_split_parents:
+            clauses.append(f"id NOT IN ({_FULLY_SPLIT_PARENT_IDS_SQL})")
+
         where = ""
         if clauses:
             where = "WHERE " + " AND ".join(clauses)
@@ -248,18 +269,70 @@ async def get_transactions(
         # was broken into per-item children. Without it a split parent looks like an
         # ordinary transaction, so the obvious thing to do — recategorize it — is
         # the one thing that would double-count the money, and the user only finds
-        # out when the write is refused. One correlated subquery over a page of 50.
+        # out when the write is refused.
+        #
+        # It counts children the way ``split_child_count()`` / the guard do —
+        # asymmetric links only. A plain ``COUNT(*) WHERE linked_transaction_id =
+        # t.id`` also counts refund and transfer COUNTERPARTS, which point at each
+        # other symmetrically: 1,078 rows in the live DB had children by that
+        # reading against 343 by this one, so ~735 ordinary rows wore an "N items"
+        # chip and would have had their category picker locked by the client-side
+        # check that now keys off this number.
+        #
+        # ``split_parent_*`` is the reverse view, for the item rows themselves: the
+        # combined charge is no longer listed beside them, so each item carries the
+        # id, amount and merchant of the charge it is part of, plus how many items
+        # that charge has. That is what makes the hidden parent reachable.
+        # Correlated subqueries over one page of rows, all id lookups.
         cursor = await db.execute(
             f"""SELECT t.*,
                        (SELECT COUNT(*) FROM transactions k
-                         WHERE k.linked_transaction_id = t.id) AS split_child_count
+                         WHERE k.linked_transaction_id = t.id
+                           AND k.id != t.id
+                           AND (t.linked_transaction_id IS NULL
+                                OR t.linked_transaction_id != k.id)) AS split_child_count,
+                       ({_SPLIT_PARENT_OF_ROW_SQL.format(column="id")})
+                         AS split_parent_id,
+                       ({_SPLIT_PARENT_OF_ROW_SQL.format(column="amount_cents")})
+                         AS split_parent_amount_cents,
+                       ({_SPLIT_PARENT_OF_ROW_SQL.format(column="merchant")})
+                         AS split_parent_merchant,
+                       (SELECT COUNT(*) FROM transactions s
+                         WHERE s.linked_transaction_id = t.linked_transaction_id
+                           AND s.id != t.linked_transaction_id) AS split_sibling_count
                 FROM transactions t {where}
                 ORDER BY {effective_sort} {effective_dir} LIMIT ? OFFSET ?""",
             params + [page_size, offset]
         )
-        transactions = []
-        for row in await cursor.fetchall():
-            transactions.append(dict(row))
+        transactions = [dict(r) for r in await cursor.fetchall()]
+
+        # ``split_parent_id`` above is any asymmetric parent, which is not yet the
+        # question the client asks. It wants "which HIDDEN combined charge is this
+        # row an item of", because that is the one the user can no longer see. One
+        # query for the page's candidate parents settles it — the alternative is
+        # embedding the aggregate above and re-running it per row per column.
+        #
+        # Two shapes drop out here, both correctly: a one-way transfer pair, whose
+        # counterpart is nobody's item, and a PARTIAL split, whose combined charge
+        # is still listed a row away and needs no pointer back to itself.
+        candidate_parents = {
+            r["split_parent_id"] for r in transactions if r.get("split_parent_id")
+        }
+        hidden_parents = set()
+        if candidate_parents:
+            placeholders = ",".join("?" * len(candidate_parents))
+            cursor = await db.execute(
+                f"""SELECT id FROM ({_FULLY_SPLIT_PARENT_IDS_SQL})
+                     WHERE id IN ({placeholders})""",
+                list(candidate_parents),
+            )
+            hidden_parents = {r[0] for r in await cursor.fetchall()}
+        for row in transactions:
+            if row.get("split_parent_id") not in hidden_parents:
+                row["split_parent_id"] = None
+                row["split_parent_amount_cents"] = None
+                row["split_parent_merchant"] = None
+                row["split_sibling_count"] = 0
 
         return {"transactions": transactions, "total": total, "totals": totals,
                 "page": page, "page_size": page_size,
@@ -272,9 +345,11 @@ async def get_split_items(txn_id: int):
     """The per-item child rows a composite charge was split into.
 
     The parent is neutralised so its money is not counted twice, which means the
-    children are the only place a split charge can actually be categorized. The UI
-    shows them inline under the parent; without that, the parent looks like an
-    ordinary row and refusing to recategorize it reads as a bug.
+    children are the only place a split charge can actually be categorized. A
+    fully-covered parent is no longer listed beside them either (see
+    ``get_transactions``), so this endpoint is now also the drill-down THROUGH an
+    item row back to the combined charge — hence the parent's merchant and date in
+    the response, not just its amount.
 
     ``balanced`` is the split's core invariant — the children must sum to the
     parent. Reported rather than assumed: if it is ever false the money is being
@@ -283,7 +358,10 @@ async def get_split_items(txn_id: int):
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT id, amount_cents, merchant FROM transactions WHERE id=?", (txn_id,)
+            """SELECT id, amount_cents, merchant, description, posted_date,
+                      category_path, account_id
+                 FROM transactions WHERE id=?""",
+            (txn_id,),
         )
         parent = await cursor.fetchone()
         if not parent:
@@ -301,6 +379,10 @@ async def get_split_items(txn_id: int):
         return {
             "parent_id": txn_id,
             "parent_amount_cents": parent["amount_cents"],
+            "parent_merchant": parent["merchant"],
+            "parent_description": parent["description"],
+            "parent_posted_date": parent["posted_date"],
+            "parent_category_path": parent["category_path"],
             "items": items,
             "item_count": len(items),
             "child_sum_cents": child_sum,
@@ -400,6 +482,44 @@ _SPLIT_PARENT_IDS_SQL = """
      WHERE c.linked_transaction_id IS NOT NULL
        AND c.id != c.linked_transaction_id
        AND (p.linked_transaction_id IS NULL OR p.linked_transaction_id != c.id)
+"""
+
+# The same asymmetric-link join, narrowed to parents the children FULLY account
+# for — ``SUM(children) = parent``, the ``balanced`` invariant of
+# ``get_split_items``. That equality is what makes the parent safe to hide from
+# the list: every cent of it is already on screen as item rows.
+#
+# The narrowing is not cosmetic. ``linked_transaction_id`` is asymmetric for
+# transfer pairs too when only one side got linked — the live DB holds 37 of
+# those, e.g. a +$5,000 "Account Transfer" whose single "child" is the −$5,000
+# counterpart on the other account. Those sum to the parent NEGATED, not to the
+# parent, and hiding one would delete a real row's money from the list. The
+# equality test separates the two shapes exactly, with no sign heuristics.
+#
+# ``MIN(p.amount_cents)`` is just "the parent's amount": it is constant within
+# each group, and naming it through an aggregate keeps the HAVING clause legal
+# rather than relying on SQLite's bare-column tolerance.
+_FULLY_SPLIT_PARENT_IDS_SQL = """
+    SELECT c.linked_transaction_id AS id
+      FROM transactions c
+      JOIN transactions p ON p.id = c.linked_transaction_id
+     WHERE c.linked_transaction_id IS NOT NULL
+       AND c.id != c.linked_transaction_id
+       AND (p.linked_transaction_id IS NULL OR p.linked_transaction_id != c.id)
+     GROUP BY c.linked_transaction_id
+    HAVING SUM(c.amount_cents) = MIN(p.amount_cents)
+"""
+
+# "Which row is this one an item OF" — the mirror of the above, per row, so a
+# child can show the combined charge it came from now that the combined charge is
+# no longer a peer row in the list. Asymmetry is re-checked here for the same
+# reason: a transfer counterpart also has ``linked_transaction_id`` set, and it is
+# nobody's item.
+_SPLIT_PARENT_OF_ROW_SQL = """
+    SELECT p.{column} FROM transactions p
+     WHERE p.id = t.linked_transaction_id
+       AND p.id != t.id
+       AND (p.linked_transaction_id IS NULL OR p.linked_transaction_id != t.id)
 """
 
 
@@ -758,16 +878,29 @@ async def _find_similar(
     *,
     skip_already_in_category: bool = True,
 ) -> dict:
-    """The rows that name the same merchant as ``txn_id`` and could take its category.
+    """The rows that are the same thing as ``txn_id`` and could take its category.
 
     Shared by ``GET /{id}/similar`` (what the user reviews) and
     ``POST /apply-similar`` (what actually gets written), deliberately as ONE
     function: if the two could drift, the list the user approved would stop being
     the list the server writes.
 
-    No LLM is involved. Matching is a merchant-key comparison over a single
-    ``SELECT`` of the table, which keeps ~10k rows well inside a few tens of
-    milliseconds — the user is waiting on this with a dropdown still open.
+    No LLM is involved. Matching is a key comparison over a single ``SELECT`` of
+    the table, which keeps ~10k rows well inside a few tens of milliseconds — the
+    user is waiting on this with a dropdown still open.
+
+    **"The same thing" is not always "the same merchant."** For an Amazon per-item
+    row the merchant is "Amazon: <product>", and every Amazon row on the ledger —
+    1,325 item rows and hundreds of bare charges — shares the token ``amazon``, so
+    a merchant key answers a question nobody asked. Filing one
+    ``Amazon: Fresh Step … Cat Litter`` row under Pets offered 56 matches, mostly
+    bare ``Amazon`` rows of unrelated amounts and a few unrelated products, and not
+    one of them was cat litter. When the source row carries a product identity
+    (``services/amazon_product_key``) the match becomes the PRODUCT — same ASIN
+    first, a truncation-tolerant product-name prefix otherwise — and candidates
+    must be Amazon item rows with the same product. A bare ``Amazon`` row names no
+    product and is therefore never a match for one. Everything else on the ledger
+    keeps the merchant-key path exactly as it was.
 
     Six exclusions, each because including the row would corrupt a total rather
     than merely annoy:
@@ -783,7 +916,11 @@ async def _find_similar(
     * **Amazon-matched rows** — their category comes from the item export (the
       actual product, or what was returned), which is strictly better
       information than a merchant key. An apply-similar on "Amazon" overwrote
-      107 correctly-booked refunds in the live DB;
+      107 correctly-booked refunds in the live DB. On the product path this
+      exclusion narrows to REFUND-matched rows only: an item row's product is
+      precisely what the source row is being matched on, so excluding item rows
+      there would exclude the only correct answers, while a refund's category
+      still comes from what was returned and must not be swept;
     * rows where the target category would violate the sign invariant.
 
     ``skip_already_in_category`` drops rows that are already there. The review
@@ -791,6 +928,12 @@ async def _find_similar(
     NOT, because a row that reached the category by another route is a legitimate
     thing to have ticked, not evidence of a forged request.
     """
+    from app.services.amazon_product_key import (
+        pattern_matches_every_item_row,
+        product_identity,
+        safe_rule_pattern,
+        same_product,
+    )
     from app.services.flat_categories import EXCLUDED_CATEGORY, TRANSFER_CATEGORIES
     from app.services.merchant_key import (
         match_strength,
@@ -803,6 +946,23 @@ async def _find_similar(
     if not row:
         raise HTTPException(status_code=404, detail="Transaction not found")
     source = dict(row)
+
+    # Does this row identify a PRODUCT? ``amazon_items.split_transaction_id`` is
+    # the authoritative link — it points at the per-item row, and at the charge
+    # itself for a single-item order that ``split_matched_charges`` relabelled in
+    # place instead of splitting. The merchant string is the fallback for the 990
+    # item rows whose links a ``reset_matches`` cleared.
+    cursor = await db.execute(
+        "SELECT asin, product_name FROM amazon_items WHERE split_transaction_id=? "
+        "ORDER BY id LIMIT 1",
+        (txn_id,),
+    )
+    item_row = await cursor.fetchone()
+    source_product = product_identity(
+        item_row["asin"] if item_row else None,
+        item_row["product_name"] if item_row else None,
+        source.get("merchant"),
+    )
 
     source_key, source_tokens = merchant_key_and_tokens(
         source.get("merchant"), source.get("description")
@@ -825,37 +985,94 @@ async def _find_similar(
             "merchant": source.get("merchant"),
             "merchant_key": source_key,
             "category_path": source.get("category_path"),
+            "product_name": source_product.name or None,
+            "asin": source_product.asin,
         },
+        # Which identity the match list was built from, so the client can say what
+        # it is showing instead of implying "same merchant" for a product match.
+        "match_kind": "amazon_product" if source_product else "merchant",
         "match_key": source_key,
         "match_label": label,
         "suggested_pattern": source_key,
+        # Set when no rule can be persisted safely — see ``safe_rule_pattern``.
+        "rule_note": None,
         "matches": [],
     }
-    # An empty key means the text named nobody ("ONLINE TRANSFER TO CHK"). The
-    # only safe reading is "no match possible" — falling back to a looser rule
-    # here would offer to recategorize the whole ledger.
-    if not source_key:
-        return result
+
+    if source_product:
+        # The group is a product, so it must be NAMED after the product: the whole
+        # list said "Amazon" before, which is exactly why the user could not tell
+        # what was about to be recategorized. The full product name is used, not
+        # the 60-character merchant truncation.
+        result["match_key"] = source_product.key
+        result["match_label"] = source_product.name
+        result["suggested_pattern"] = safe_rule_pattern(source_product)
+        if not result["suggested_pattern"]:
+            result["rule_note"] = (
+                "No automatic rule was saved for this product. A rule is matched as "
+                "a substring against every future merchant and description, and the "
+                "only string this product's rows share with each other is 'Amazon' — "
+                "which would recategorize every unrelated Amazon charge on the next "
+                "import. The rows you pick here are still updated."
+            )
+    else:
+        if pattern_matches_every_item_row(source_key):
+            # A bare "Amazon" charge keys to "amazon", and that pattern matches every
+            # "Amazon: <product>" row ever imported. Applying the category to the
+            # rows in this list is what the user asked for; persisting it as a rule
+            # would overwrite the per-product categories on the next import, before
+            # the item export is even read. So: no rule, and say why.
+            result["suggested_pattern"] = ""
+            result["rule_note"] = (
+                "No automatic rule was saved. A rule for 'Amazon' is matched as a "
+                "substring, so it would also claim every 'Amazon: <product>' item row "
+                "on the next import and replace the per-product categories with this "
+                "one. The rows you pick here are still updated."
+            )
+        if not source_key:
+            # An empty key means the text named nobody ("ONLINE TRANSFER TO CHK").
+            # The only safe reading is "no match possible" — falling back to a looser
+            # rule here would offer to recategorize the whole ledger.
+            return result
 
     skip_categories = {*TRANSFER_CATEGORIES, EXCLUDED_CATEGORY}
     skip_entity_types = {"transfer", "excluded", "asset_conversion"}
 
-    # Rows whose category is derived from better information than a merchant key,
-    # in ONE query rather than one per candidate — this function answers while a
-    # dropdown is open and is called on every inline edit. Split parents come from
-    # the asymmetric-link join; Amazon-matched rows from the indexed
+    # Rows whose category is derived from better information than the key being
+    # matched on, in ONE query rather than one per candidate — this function answers
+    # while a dropdown is open and is called on every inline edit. Split parents
+    # come from the asymmetric-link join; Amazon rows from the indexed
     # ``matched_transaction_id`` / ``split_transaction_id`` columns.
     #
-    cursor = await db.execute(
-        f"""{_SPLIT_PARENT_IDS_SQL}
+    # On the PRODUCT path the Amazon-item exclusion is dropped, and only there:
+    # those rows are the ones whose product is being compared, so excluding them
+    # would exclude every correct answer — it is what left the cat-litter search
+    # with 56 matches, none of which were cat litter. Refund-matched rows stay
+    # excluded on both paths: a refund's category comes from what was returned.
+    amazon_item_exclusion = "" if source_product else """
             UNION
             SELECT matched_transaction_id FROM amazon_items
-             WHERE matched_transaction_id IS NOT NULL
+             WHERE matched_transaction_id IS NOT NULL"""
+    cursor = await db.execute(
+        f"""{_SPLIT_PARENT_IDS_SQL}{amazon_item_exclusion}
             UNION
             SELECT matched_transaction_id FROM amazon_refunds
              WHERE matched_transaction_id IS NOT NULL"""
     )
     protected_ids = {r[0] for r in await cursor.fetchall() if r[0] is not None}
+
+    # Product identities for every Amazon item row that still has a link, in one
+    # query. Rows missing from this map fall back to their merchant string, which
+    # is where a reset-orphaned item row's product name lives.
+    item_identities = {}
+    if source_product:
+        cursor = await db.execute(
+            "SELECT split_transaction_id AS id, asin, product_name FROM amazon_items "
+            "WHERE split_transaction_id IS NOT NULL"
+        )
+        item_identities = {
+            r["id"]: (r["asin"], r["product_name"]) for r in await cursor.fetchall()
+        }
 
     # Split CHILDREN need a source-dependent rule rather than a blanket exclusion.
     #
@@ -867,26 +1084,33 @@ async def _find_similar(
     # produce.
     #
     # But a blanket exclusion would break the case that IS useful: filing one
-    # "Amazon: Fresh Step cat litter" child under Pets and applying that to the
-    # other Fresh Step rows, which are all children too. So children are offered
+    # component row of a split (a mortgage escrow line, say) and applying that to
+    # the other rows like it, which are all children too. So children are offered
     # only when the source is itself a child — like propagates to like.
     #
-    # "Is this a split child?" cannot rely on ``linked_transaction_id`` alone:
-    # ``reset_matches`` clears those links when the authoritative source changes,
-    # and 490 product rows in the live DB are orphaned that way. Being referenced
-    # by ``amazon_items.split_transaction_id`` still identifies them.
-    cursor = await db.execute(
-        """SELECT id FROM transactions WHERE linked_transaction_id IS NOT NULL
-           UNION
-           SELECT split_transaction_id FROM amazon_items
-            WHERE split_transaction_id IS NOT NULL"""
-    )
-    split_child_ids = {r[0] for r in await cursor.fetchall() if r[0] is not None}
-    source_is_split_child = (
-        source.get("linked_transaction_id") is not None or source["id"] in split_child_ids
-    )
-    if not source_is_split_child:
-        protected_ids |= split_child_ids
+    # This whole rule is now reached only by a source with NO product identity. An
+    # Amazon item row goes down the product path instead, where identity decides
+    # which children are the same thing; the "source is a child, so any child may
+    # match" hatch is precisely what let the product tokens be ignored and put 56
+    # unrelated rows in front of the user.
+    if not source_product:
+        # "Is this a split child?" cannot rely on ``linked_transaction_id`` alone:
+        # ``reset_matches`` clears those links when the authoritative source
+        # changes, and 490 product rows in the live DB are orphaned that way. Being
+        # referenced by ``amazon_items.split_transaction_id`` still identifies them.
+        cursor = await db.execute(
+            """SELECT id FROM transactions WHERE linked_transaction_id IS NOT NULL
+               UNION
+               SELECT split_transaction_id FROM amazon_items
+                WHERE split_transaction_id IS NOT NULL"""
+        )
+        split_child_ids = {r[0] for r in await cursor.fetchall() if r[0] is not None}
+        source_is_split_child = (
+            source.get("linked_transaction_id") is not None
+            or source["id"] in split_child_ids
+        )
+        if not source_is_split_child:
+            protected_ids |= split_child_ids
 
     # Scope, for the same reason every other view has it: with Plaid linked, each
     # real transaction also exists as a superseded CSV row, and offering to
@@ -923,14 +1147,43 @@ async def _find_similar(
         if already and skip_already_in_category:
             continue
 
-        cand_key, cand_tokens = merchant_key_and_tokens(
-            cand.get("merchant"), cand.get("description")
-        )
-        strength = match_strength(source_key, source_tokens, cand_key, cand_tokens)
-        # "partial" is computed but never accepted: a wrong row here is written
-        # without the user ever seeing it again.
-        if strength not in ("exact", "strong"):
-            continue
+        if source_product:
+            cand_asin, cand_name = item_identities.get(cand["id"], (None, None))
+            cand_product = product_identity(cand_asin, cand_name, cand.get("merchant"))
+            # No product identity, no match: that is the rule that keeps a bare
+            # "Amazon" charge — which names no product at all — out of a specific
+            # product's list.
+            if not same_product(source_product, cand_product):
+                continue
+            # Amazon's own product id agreeing is as exact as identity gets; a
+            # name-prefix agreement is strong but inferred.
+            strength = (
+                "exact" if source_product.asin and cand_product.asin else "strong"
+            )
+            # What this row actually IS. The review list showed "Amazon" for every
+            # match, which is unreviewable — the user could not tell cat litter from
+            # tracing paper.
+            cand["product_name"] = cand_product.name
+        else:
+            # An item row is a different granularity from a charge: the source names
+            # a payee, the candidate names one product inside somebody's order. A
+            # merchant key cannot tell them apart — "amazon" is a subset of
+            # "amazon fresh step clean paws…" and therefore a "strong" match — so
+            # this is the check that stops one bare Amazon edit from flattening
+            # every product-level category. The link-based exclusion above cannot do
+            # it alone: 265 item rows in the live DB lost their links to a
+            # ``reset_matches`` and are identifiable only by the merchant string.
+            if product_identity(merchant=cand.get("merchant")):
+                continue
+            cand_key, cand_tokens = merchant_key_and_tokens(
+                cand.get("merchant"), cand.get("description")
+            )
+            strength = match_strength(source_key, source_tokens, cand_key, cand_tokens)
+            # "partial" is computed but never accepted: a wrong row here is written
+            # without the user ever seeing it again.
+            if strength not in ("exact", "strong"):
+                continue
+            cand["product_name"] = None
 
         amt = int(cand.get("amount_cents") or 0)
         if violates_sign_invariant(determine_entity_type(category_path, amt), amt):
@@ -955,7 +1208,9 @@ async def get_similar_transactions(
 
     Read-only on purpose: the user sees the count and the rows before anything is
     written, which is what makes a deterministic matcher preferable to an LLM
-    here — the reasoning is a merchant key they can read.
+    here — the reasoning is a key they can read: a merchant key, or a product
+    (``match_kind``), in which case every row carries the ``product_name`` that put
+    it in the list.
     """
     db = await get_db()
     try:
@@ -971,6 +1226,10 @@ async def get_similar_transactions(
                 "account_id": m["account_id"],
                 "category_path": m["category_path"],
                 "strength": m["strength"],
+                # What the row is, when the match was made on a product. Never a
+                # fallback to the merchant: "Amazon" is the label that made this
+                # list unreviewable in the first place.
+                "product_name": m.get("product_name"),
             }
             for m in matches[:limit]
         ]
@@ -1059,6 +1318,8 @@ async def apply_similar_transactions(req: ApplySimilarRequest):
         # that succeeded.
         rule_id = None
         context_updated = False
+        is_product = found.get("match_kind") == "amazon_product"
+        key_kind = "product" if is_product else "merchant key"
         if req.create_rule and found["suggested_pattern"]:
             pattern = found["suggested_pattern"]
             try:
@@ -1074,7 +1335,7 @@ async def apply_similar_transactions(req: ApplySimilarRequest):
             try:
                 context_updated = bool(append_context_fact(
                     f"- Transactions from '{found['match_label']}' "
-                    f"(merchant key '{pattern}') are categorized as {req.category_path}."
+                    f"({key_kind} '{pattern}') are categorized as {req.category_path}."
                 ))
             except Exception:
                 logger.exception("apply-similar: failed to append context fact")
@@ -1085,6 +1346,11 @@ async def apply_similar_transactions(req: ApplySimilarRequest):
             "skipped_count": skipped,
             "rule_id": rule_id,
             "context_updated": context_updated,
+            # Why no rule exists, when the client asked for one and the matcher
+            # could not express one safely. Silence here would read as "saved".
+            "rule_note": (
+                found.get("rule_note") if req.create_rule and rule_id is None else None
+            ),
         }
     finally:
         await db.close()
