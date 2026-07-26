@@ -1,8 +1,11 @@
+import logging
 from fastapi import APIRouter, Query
 from typing import Optional
 from datetime import datetime, date
 from app.database import get_db
 from app.services.account_meta import load_account_meta
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -19,25 +22,68 @@ async def _net_worth_accounts(db):
     return [a for a in await load_account_meta(db) if a["include_in_net_worth"]]
 
 
-async def _get_mortgage_balance(db):
-    cursor = await db.execute(
-        "SELECT ending_balance_cents, month FROM amortization ORDER BY month ASC LIMIT 1"
-    )
-    row = await cursor.fetchone()
-    if row:
-        return row["ending_balance_cents"]
-    return 0
+async def _mortgage_position(db):
+    """The real mortgage position: what is owed now, and month by month.
 
+    This used to read the FIRST ROW of the ``amortization`` table for both. That
+    table is the lender's forward PROJECTION, issued mid-life after a large
+    curtailment, so its opening balance is a mid-loan figure — not what is owed
+    and not what was borrowed. Two consequences were visible on the page: a
+    $153,538.15 liability on a loan that has been paid off since 2026-07-08, and
+    a history that carried that same debt back to 2023-12, years before the loan
+    existed.
 
-async def _get_amortization_by_month(db):
-    cursor = await db.execute(
-        "SELECT month, ending_balance_cents, principal_cents FROM amortization ORDER BY month"
-    )
-    rows = await cursor.fetchall()
-    return {r["month"][:7]: {
-        "balance": r["ending_balance_cents"],
-        "principal": r["principal_cents"],
-    } for r in rows}
+    ``services.mortgage.analyze`` derives the balance from the actual payment
+    stream against the owner's stated terms, so a closed loan reports zero. The
+    projection survives only as the fallback for a loan we cannot derive (no
+    stated terms and no payments), where a stale anchor still beats nothing.
+
+    Returns ``(balance_cents, property_value_cents, by_month)``, where
+    ``by_month`` maps ``YYYY-MM`` to the balance owed at the END of that month
+    and starts at the month of the first payment — months before that get no
+    property and no debt, which is what "we did not own it yet" means.
+    """
+    from app.services import mortgage as mortgage_service
+
+    balance_cents = None
+    property_value = None
+    by_month: dict = {}
+    first_month = None
+
+    try:
+        analysis = await mortgage_service.analyze(db)
+    except Exception as exc:  # a broken loan must not take the whole page down
+        logger.warning("Net worth: mortgage analysis unavailable (%s)", exc)
+        analysis = None
+
+    if analysis:
+        figures = analysis.get("figures") or {}
+        balance_cents = (figures.get("final_balance") or {}).get("cents")
+        property_value = (figures.get("purchase_price") or {}).get("cents")
+        first_payment = analysis.get("first_payment_date")
+        first_month = first_payment[:7] if first_payment else None
+
+        # Balance after each real payment, keyed by month. Several payments can
+        # land in one month (a monthly ACH plus a curtailment); the last one wins
+        # because it is what is owed when the month ends.
+        for row in analysis.get("timeline") or []:
+            month = (row.get("posted_date") or "")[:7]
+            after = row.get("balance_after_cents")
+            if month and after is not None:
+                by_month[month] = after
+
+    if balance_cents is None:
+        cursor = await db.execute(
+            "SELECT ending_balance_cents FROM amortization ORDER BY month ASC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        balance_cents = row["ending_balance_cents"] if row else 0
+
+    # Property value is a stated fact or it is nothing. The old
+    # `max(balance * 2, $300,000)` was arithmetic dressed up as an estimate: it
+    # moved every time a payment landed, and on a paid-off loan it collapses to
+    # the $300,000 floor regardless of what the house is worth.
+    return int(balance_cents or 0), property_value, by_month, first_month
 
 
 async def _compute_account_balances(db):
@@ -50,9 +96,14 @@ async def _compute_account_balances(db):
 
 async def _compute_current_balances(db):
     balances = await _compute_account_balances(db)
-    mortgage_balance = await _get_mortgage_balance(db)
+    mortgage_balance, property_value, mortgage_by_month, first_mortgage_month = (
+        await _mortgage_position(db)
+    )
 
-    estimated_property_value = int(max(mortgage_balance * 2.0, 30000000))
+    # No stated purchase price means no defensible number, so the property line
+    # carries 0 and says so rather than inventing a valuation.
+    estimated_property_value = int(property_value or 0)
+    property_basis = "stated" if property_value else "unknown"
 
     accounts = []
     for meta in await _net_worth_accounts(db):
@@ -64,6 +115,7 @@ async def _compute_current_balances(db):
                 "name": meta["display_name"],
                 "kind": "real_estate",
                 "balance": estimated_property_value,
+                "value_basis": property_basis,
                 "debt": mortgage_balance,
             })
         else:
@@ -91,17 +143,20 @@ async def _compute_current_balances(db):
             else:
                 liabilities += abs(a["balance"])
 
-    return accounts, assets, liabilities, estimated_property_value, mortgage_balance
+    return (accounts, assets, liabilities, estimated_property_value, mortgage_balance,
+            mortgage_by_month, first_mortgage_month)
 
 
 @router.get("/api/net-worth")
 async def get_net_worth():
     db = await get_db()
     try:
-        accounts, assets, liabilities, prop_val, mortgage_bal = await _compute_current_balances(db)
+        (accounts, assets, liabilities, prop_val, mortgage_bal,
+         mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
         total_net_worth = assets - liabilities
 
-        history = await _compute_history(db, prop_val, mortgage_bal)
+        history = await _compute_history(db, prop_val, mortgage_bal,
+                                        mortgage_by_month, first_mortgage_month)
 
         return {
             "as_of": date.today().isoformat(),
@@ -122,8 +177,10 @@ async def get_net_worth_history(
 ):
     db = await get_db()
     try:
-        accounts, assets, liabilities, prop_val, mortgage_bal = await _compute_current_balances(db)
-        history = await _compute_history(db, prop_val, mortgage_bal)
+        (accounts, assets, liabilities, prop_val, mortgage_bal,
+         mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
+        history = await _compute_history(db, prop_val, mortgage_bal,
+                                        mortgage_by_month, first_mortgage_month)
 
         if start:
             history = [h for h in history if h["date"] >= start[:7] + "-01"]
@@ -138,7 +195,8 @@ async def get_net_worth_history(
         await db.close()
 
 
-async def _compute_history(db, prop_val, current_mortgage):
+async def _compute_history(db, prop_val, current_mortgage,
+                           mortgage_by_month=None, first_mortgage_month=None):
     cursor = await db.execute(
         "SELECT MIN(posted_date) as min_d, MAX(posted_date) as max_d FROM transactions"
     )
@@ -158,7 +216,10 @@ async def _compute_history(db, prop_val, current_mortgage):
     except ValueError:
         end_month = datetime.now()
 
-    amort_by_month = await _get_amortization_by_month(db)
+    # Balance owed at the end of each month, from the REAL payment stream. Months
+    # between payments inherit the last known balance (carried forward below);
+    # months before the first payment get no property and no debt.
+    mortgage_by_month = mortgage_by_month or {}
 
     cursor = await db.execute("""
         SELECT account_id,
@@ -179,7 +240,7 @@ async def _compute_history(db, prop_val, current_mortgage):
 
     today_str = date.today().strftime("%Y-%m")
     all_months_raw = set(r["month"] for r in flow_rows)
-    for m in amort_by_month:
+    for m in mortgage_by_month:
         if m <= today_str:
             all_months_raw.add(m)
     all_months = sorted(all_months_raw)
@@ -189,6 +250,9 @@ async def _compute_history(db, prop_val, current_mortgage):
 
     cumulative = {}
     history = []
+    # Carried forward between payment months. Starts at None so that months
+    # before the loan existed report no debt instead of today's figure.
+    running_mortgage = None
 
     for m in all_months:
         month_data = monthly_flows.get(m, {})
@@ -199,6 +263,11 @@ async def _compute_history(db, prop_val, current_mortgage):
                 cumulative[aid] = 0
             cumulative[aid] += flow
 
+        # A month with a payment sets the balance; a month without one keeps the
+        # previous balance, which is what "nothing was paid" means.
+        if m in mortgage_by_month:
+            running_mortgage = mortgage_by_month[m]
+
         assets_m = 0
         liabilities_m = 0
 
@@ -206,10 +275,14 @@ async def _compute_history(db, prop_val, current_mortgage):
             cum_bal = cumulative.get(meta["account_id"], 0)
 
             if meta["kind"] == "real_estate":
-                amort_info = amort_by_month.get(m, {})
-                bal = amort_info.get("balance", current_mortgage) if amort_info else current_mortgage
+                # The house is only an asset from the month the loan starts —
+                # before that the history was claiming both the property and its
+                # mortgage years before either existed.
+                owned = first_mortgage_month is None or m >= first_mortgage_month
+                if not owned:
+                    continue
                 assets_m += prop_val
-                liabilities_m += bal
+                liabilities_m += running_mortgage if running_mortgage is not None else 0
             elif meta["kind"] == "credit":
                 if cum_bal < 0:
                     liabilities_m += abs(cum_bal)
