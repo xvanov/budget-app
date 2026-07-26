@@ -14,7 +14,8 @@ import { chromium } from 'playwright';
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:8083';
 // Every nav destination. Accounts & Sync used to be a standalone /accounts.html
 // page; it is a normal in-app route now.
-const ROUTES = ['/', '/txns', '/income', '/expenses', '/refunded', '/excluded', '/mortgage', '/activity', '/compare',
+const ROUTES = ['/', '/txns', '/income', '/expenses', '/merchants', '/refunded', '/excluded', '/mortgage',
+                '/activity', '/compare',
                 '/trends', '/budgets', '/context', '/chat', '/networth', '/accounts'];
 
 const browser = await chromium.launch();

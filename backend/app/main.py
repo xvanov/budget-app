@@ -10,6 +10,9 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %
 
 from app.database import init_db, seed_categories, backfill_explainability
 from app.routers import health, import_routes, transactions, accounts, context, transfers, categorize, rules, categories, mortgage, paystubs, budgets, compare, net_worth, trends, anomalies, sankey, chat_correct, amazon, plaid_routes
+# Own import line on purpose: several agents are editing the shared one above, and
+# a one-name addition there is a guaranteed merge conflict for no benefit.
+from app.routers import merchants
 from app.services.import_state import import_state
 
 logger = logging.getLogger(__name__)
@@ -150,3 +153,6 @@ app.include_router(sankey.router)
 app.include_router(chat_correct.router)
 app.include_router(amazon.router)
 app.include_router(plaid_routes.router)
+# Spending by vendor. Appended rather than slotted in, same merge-conflict reason
+# as the import above.
+app.include_router(merchants.router)
