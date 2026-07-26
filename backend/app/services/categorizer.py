@@ -175,6 +175,27 @@ async def _live_categories(db) -> List[str]:
     return [n for n in names if n != EXCLUDED_CATEGORY]
 
 
+def _fallback_category(allowed: Dict[str, str]) -> str:
+    """Where a row goes when the model names a category the user does not have.
+
+    ``Uncategorized`` is the last resort rather than the first, because it is not
+    a category — every total, chart and rollup filters it out (`/api/dashboard`,
+    `trends._main_series`, `merchant_rollup.fetch_rows`, `/api/sankey` all carry
+    ``category_path != 'Uncategorized'``). Money filed there leaves the books
+    silently: the transaction still exists and still counts toward row counts, but
+    no figure on screen includes it.
+
+    So prefer any real bucket the user actually has, in decreasing order of "this
+    is obviously a junk drawer". `Other` is the usual one, but a tidy owner deletes
+    it — and Housing and Travel have already been deleted on this install, which is
+    exactly how a supposedly-safe default becomes reachable.
+    """
+    for candidate in ("other", "miscellaneous", "misc", "uncategorised", "unsorted"):
+        if candidate in allowed:
+            return allowed[candidate]
+    return "Uncategorized"
+
+
 async def _categorize_batch(db, batch: List[Dict[str, Any]]) -> int:
     batch_ids = {t["id"] for t in batch}
     available = await _live_categories(db)
@@ -183,7 +204,7 @@ async def _categorize_batch(db, batch: List[Dict[str, Any]]) -> int:
     # the row the user actually has. Empty when the DB has no categories yet, in
     # which case the model's answer is taken as-is (the pre-existing behaviour).
     allowed = {n.casefold(): n for n in available}
-    unknown_fallback = "Other" if "other" in allowed else "Uncategorized"
+    unknown_fallback = _fallback_category(allowed)
 
     try:
         response = await asyncio.to_thread(call_llm, prompt)

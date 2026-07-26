@@ -314,12 +314,32 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
 
     pairs = find_pairs(rows)
 
-    # Clear previous marks inside this scope before re-marking, so an unpaired
-    # row does not keep a stale flag forever.
+    # Clear previous marks before re-marking, so an unpaired row does not keep a
+    # stale flag forever. Two conditions on this wipe, each of which cost real
+    # correctness when it was missing:
+    #
+    # 1. ``linked_transaction_id IS NULL`` mirrors the candidate query above. The
+    #    wipe used to clear every row in scope while only unlinked rows could ever
+    #    be re-paired, so a split item row that was correctly paired lost its mark
+    #    permanently on the next pass. 628 rows in the live DB sit in that
+    #    wipe-but-never-repair set. Nothing was paired yet, so nothing was lost —
+    #    but detection now runs after every sync rather than only when a human
+    #    clicks it, so the window was about to become hourly and unattended.
+    #
+    # 2. The partner is cleared too, even when it lives outside this scope. A pair
+    #    spans two rows and a scoped wipe could clear one half and leave the other
+    #    pointing at it — 12 such half-pairs already exist, and one of them makes
+    #    /api/refunded report a $235.36 charge as 25% refunded when it was never
+    #    refunded at all. A pair is cleared whole or not at all.
     await db.execute(
-        f"UPDATE transactions SET refund_match_id=NULL, refund_role=NULL, refund_partial=0 "
-        f"WHERE refund_match_id IS NOT NULL AND id IN "
-        f"(SELECT id FROM transactions t WHERE 1=1 {scope_sql})"
+        f"""UPDATE transactions SET refund_match_id=NULL, refund_role=NULL, refund_partial=0
+            WHERE refund_match_id IS NOT NULL
+              AND (
+                id IN (SELECT id FROM transactions t
+                        WHERE t.linked_transaction_id IS NULL {scope_sql})
+                OR refund_match_id IN (SELECT id FROM transactions t
+                                        WHERE t.linked_transaction_id IS NULL {scope_sql})
+              )"""
     )
 
     for pair in pairs:
@@ -361,7 +381,11 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
             logger.exception("failed to re-apply reconciliation for %r", pattern)
     if reapplied:
         result["reapplied_reconciliations"] = reapplied
-        result["pairs"] += sum(r["pairs"] for r in reapplied)
+        # Reported alongside, NOT folded into `pairs`. Adding them made `pairs`
+        # (58) stop equalling `full_refunds + partial_refunds` (21+28=49), so the
+        # sync summary claimed nine more pairs than detection had classified.
+        result["reapplied_pairs"] = sum(r["pairs"] for r in reapplied)
+        result["total_pairs"] = result["pairs"] + result["reapplied_pairs"]
 
     logger.info("Refund pairing: %s", result)
     return result

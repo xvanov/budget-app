@@ -77,6 +77,10 @@ _NON_PRODUCT_NAMES = frozenset({"tax shipping", "tax and shipping", "shipping",
 # a whole name: fail closed, offer no propagation, let the user file by hand.
 _MIN_NAME_TOKENS = 3
 _MIN_NAME_CHARS = 12
+# A name shorter than this is complete, not cut off, so it may only match itself.
+# The feed truncates around 60 characters; 40 leaves room for normalisation having
+# dropped punctuation and stop words from a genuinely truncated name.
+_TRUNCATION_MIN_CHARS = 40
 
 # A rule pattern is a substring of future merchant/description text, so it must
 # be long enough to name this product and nothing else. 16 characters of a
@@ -200,6 +204,17 @@ def _name_prefix_match(a: Sequence[str], b: Sequence[str]) -> bool:
         return False
     short, long_ = (a, b) if len(a) <= len(b) else (b, a)
     if len(short) < _MIN_NAME_TOKENS:
+        return False
+    # The shorter name has to look like a TRUNCATION, not merely a prefix. A prefix
+    # alone fuses a product with its accessory: "Apple Lightning Cable" is a token
+    # prefix of "Apple Lightning Cable Adapter 2 Pack", and "Kirkland Signature
+    # Bath Tissue" of "…Bath Tissue Holder Stand" — different SKUs, and where
+    # neither row carries an ASIN nothing else would separate them. A real
+    # truncation comes from the ~60-character merchant cut, so a short name well
+    # under that length is a complete name and must match only itself.
+    # (No live row hits this today; the rule exists so that a persisted
+    # apply-similar pattern cannot start claiming accessories on a future import.)
+    if len(" ".join(short)) < _TRUNCATION_MIN_CHARS and len(short) != len(long_):
         return False
     if tuple(long_[: len(short) - 1]) != tuple(short[: -1]):
         return False

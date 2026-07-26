@@ -164,6 +164,28 @@ async def _rollup(db, *, start_date, end_date, scope, categories, merchant_keys,
     }
 
 
+def _by_category(rows_by_key: dict) -> list:
+    """Category facets over a {merchant_key: rows} subset, in the shape
+    ``_rollup`` returns. Needed because a ``q`` search narrows the vendors after
+    the rollup has already faceted the wider set. Taking the rows keyed by vendor
+    rather than as one flat list is what lets ``merchant_count`` stay truthful."""
+    facets: dict = {}
+    for key, rows in rows_by_key.items():
+        for row in rows:
+            f = facets.setdefault(row["category_path"],
+                                 {"category_path": row["category_path"], "spend_cents": 0,
+                                  "transaction_count": 0, "merchant_keys": set()})
+            f["spend_cents"] += -int(row["effective_amount_cents"] or 0)
+            f["transaction_count"] += 1
+            f["merchant_keys"].add(key)
+    return sorted(
+        [{"category_path": f["category_path"], "spend_cents": int(f["spend_cents"]),
+          "transaction_count": f["transaction_count"],
+          "merchant_count": len(f["merchant_keys"])} for f in facets.values()],
+        key=lambda f: -f["spend_cents"],
+    )
+
+
 def _totals(rows) -> dict:
     spend = -sum(int(r["effective_amount_cents"] or 0) for r in rows)
     gross = sum(-int(r["amount_cents"]) for r in rows if int(r["amount_cents"] or 0) < 0)
@@ -212,10 +234,19 @@ async def get_merchants(
                           granularity=granularity)
 
         merchants = r["merchants"]
+        # `q` narrows the vendor set, so it has to narrow the numbers derived from
+        # it too. It used to filter only the ranking, leaving totals, the chart,
+        # the category facets and hidden_spend_cents on the whole period: a search
+        # for one vendor rendered "Total spend $61,386.86" beside "1 vendors" with
+        # that vendor drawn as 100% of the pie.
+        q_rows = None
         if q:
             needle = q.strip().lower()
             merchants = [m for m in merchants
                          if needle in m["label"].lower() or needle in m["merchant_key"]]
+            kept_keys = {m["merchant_key"] for m in merchants}
+            q_rows_by_key = {k: r["family_rows"].get(k, []) for k in kept_keys}
+            q_rows = [row for rows in q_rows_by_key.values() for row in rows]
         merchants.sort(key=_SORTS.get(sort, _SORTS["spend"]))
         if sort == "recent":
             merchants.reverse()
@@ -230,7 +261,8 @@ async def get_merchants(
             m["series"] = roll.build_series(r["family_rows"].get(m["merchant_key"], []),
                                             r["granularity"], r["first"], r["last"])
 
-        totals = _totals(r["filtered"])
+        rows_for_totals = r["filtered"] if q_rows is None else q_rows
+        totals = _totals(rows_for_totals)
         totals["merchant_count"] = total_merchants
         unidentified = next((m for m in merchants if m["unidentified"]), None)
 
@@ -264,8 +296,9 @@ async def get_merchants(
                  "transaction_count": unidentified["transaction_count"]}
                 if unidentified else None
             ),
-            "by_category": r["by_category"],
-            "series": roll.build_series(r["filtered"], r["granularity"],
+            "by_category": (r["by_category"] if q_rows is None
+                            else _by_category(q_rows_by_key)),
+            "series": roll.build_series(rows_for_totals, r["granularity"],
                                         r["first"], r["last"]),
             "diagnostics": {
                 "split_parent_rows_excluded": r["meta"]["split_parent_rows_excluded"],

@@ -144,7 +144,7 @@ async def _net_worth_series(db, start_date, end_date):
 
     (accounts, assets, liabilities, prop_val, mortgage_bal,
      mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
-    history = await _compute_history(db, prop_val, mortgage_bal,
+    history = await _compute_history(db, accounts,
                                     mortgage_by_month, first_mortgage_month)
 
     if start_date:

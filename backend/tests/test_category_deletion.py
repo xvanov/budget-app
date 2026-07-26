@@ -383,7 +383,11 @@ async def test_reassign_delete_moves_transactions_and_persists(test_client,
     cat_id = _id_of(test_client, "Entertainment")
     resp = test_client.delete(f"/api/categories/{cat_id}?reassign_to=Other")
     assert resp.status_code == 200, resp.text
-    assert resp.json()["transactions_moved"] == 2
+    # `>= 2`, not `== 2`: the DB is shared across the session and another test file
+    # (test_budgets) seeds its own Entertainment rows, so an exact count made this
+    # pass alone and fail when the suite ran in file order. What this test is about
+    # is that THESE two rows move and keep the right entity_type — asserted below.
+    assert resp.json()["transactions_moved"] >= 2
     assert "Entertainment" not in _paths(test_client)
 
     db = await get_db()

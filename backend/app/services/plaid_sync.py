@@ -364,8 +364,10 @@ async def sync_all(db, client=None, categorize: bool = True) -> Dict[str, Any]:
             # NB `detect_and_store` reports "pairs" as a COUNT. Its neighbour
             # `list_pairs` uses the same key for the full list of pair objects and
             # puts the count under "count" — so reading "count" here silently
-            # yields 0 forever.
-            totals["refund_pairs"] = int(result.get("pairs") or 0)
+            # yields 0 forever. `total_pairs` includes re-applied vendor
+            # reconciliations; `pairs` is what detection itself classified.
+            totals["refund_pairs"] = int(result.get("total_pairs")
+                                         or result.get("pairs") or 0)
         except Exception as exc:
             logger.warning("Post-sync refund detection failed: %s", exc)
             totals["errors"].append({"stage": "refund_pairs", "error": str(exc)[:200]})

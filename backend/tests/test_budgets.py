@@ -31,6 +31,12 @@ def _make_mock_llm():
     return mock_call_llm
 
 
+# These tests seed the DB by importing `samples/`, whose rows carry their bank's
+# own source_platform ('chase', 'bofa', …) — i.e. the pre-Plaid CSV history. The
+# budget endpoints now default to the live (plaid+manual) scope so their spend
+# matches the dashboard's, which means CSV-only fixtures measure zero unless they
+# ask for `scope=all`. That is the point of the fix, not a regression: an unscoped
+# budget counted every twinned transaction twice and read ~2x.
 def _import_with_mock(test_client, monkeypatch):
     monkeypatch.setattr("app.services.categorizer.call_llm", _make_mock_llm())
     resp = test_client.post("/api/import/samples")
@@ -159,7 +165,7 @@ class TestBudgetStatusFields:
             "period": "month",
             "label": "field_test",
         })
-        resp = imported_data.get("/api/budgets/status?period_start=2026-01-01&period_end=2026-01-31")
+        resp = imported_data.get("/api/budgets/status?scope=all&period_start=2026-01-01&period_end=2026-01-31")
         assert resp.status_code == 200
         budgets = [b for b in resp.json()["budgets"] if b["label"] == "field_test"]
         assert len(budgets) == 1
@@ -183,7 +189,7 @@ class TestBudgetStatusFields:
             "period": "month",
             "label": "period_test",
         })
-        resp = imported_data.get("/api/budgets/status?period_start=2026-01-01&period_end=2026-01-31")
+        resp = imported_data.get("/api/budgets/status?scope=all&period_start=2026-01-01&period_end=2026-01-31")
         assert resp.status_code == 200
         budgets = [b for b in resp.json()["budgets"] if b["label"] == "period_test"]
         assert len(budgets) == 1
@@ -199,7 +205,7 @@ class TestBudgetStatusFields:
             "period": "month",
             "label": "green_test",
         })
-        resp = imported_data.get("/api/budgets/status?period_start=2000-01-01&period_end=2000-01-31")
+        resp = imported_data.get("/api/budgets/status?scope=all&period_start=2000-01-01&period_end=2000-01-31")
         budgets = [b for b in resp.json()["budgets"] if b["label"] == "green_test"]
         assert len(budgets) == 1
         assert budgets[0]["color"] == "green"
@@ -213,7 +219,7 @@ class TestBudgetStatusFields:
             "period": "month",
             "label": "red_test",
         })
-        resp = imported_data.get("/api/budgets/status?period_start=2026-01-01&period_end=2026-01-31")
+        resp = imported_data.get("/api/budgets/status?scope=all&period_start=2026-01-01&period_end=2026-01-31")
         budgets = [b for b in resp.json()["budgets"] if b["label"] == "red_test"]
         assert len(budgets) == 1
         b = budgets[0]
@@ -229,7 +235,7 @@ class TestBudgetStatusFields:
             "period": "month",
             "label": "pct_income_test",
         })
-        resp = imported_data.get("/api/budgets/status?period_start=2026-01-01&period_end=2026-01-31")
+        resp = imported_data.get("/api/budgets/status?scope=all&period_start=2026-01-01&period_end=2026-01-31")
         assert resp.status_code == 200
         budgets = [b for b in resp.json()["budgets"] if b["label"] == "pct_income_test"]
         assert len(budgets) == 1
@@ -246,7 +252,7 @@ class TestBudgetStatusFields:
             "period": "month",
             "label": "overrun_test",
         })
-        resp = imported_data.get("/api/budgets/status?period_start=2026-01-01&period_end=2026-01-31")
+        resp = imported_data.get("/api/budgets/status?scope=all&period_start=2026-01-01&period_end=2026-01-31")
         budgets = [b for b in resp.json()["budgets"] if b["label"] == "overrun_test"]
         assert len(budgets) == 1
         assert budgets[0]["forecast_overrun_cents"] > 0
@@ -436,7 +442,7 @@ class TestBudgetIntelligence:
 
     def test_intelligence_returns_shape(self, imported_data):
         resp = imported_data.get(
-            "/api/budgets/intelligence?period_start=2026-01-01&period_end=2026-01-31"
+            "/api/budgets/intelligence?scope=all&period_start=2026-01-01&period_end=2026-01-31"
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -465,7 +471,7 @@ class TestBudgetIntelligence:
             "label": "intel_overbudget_test",
         })
         resp = imported_data.get(
-            "/api/budgets/intelligence?period_start=2026-01-01&period_end=2026-01-31"
+            "/api/budgets/intelligence?scope=all&period_start=2026-01-01&period_end=2026-01-31"
         )
         assert resp.status_code == 200
         risks = [i for i in resp.json()["insights"] if i["kind"] == "over-budget-risk"]
@@ -487,7 +493,7 @@ class TestBudgetIntelligence:
             "label": "intel_savings_test",
         })
         resp = imported_data.get(
-            "/api/budgets/intelligence?period_start=2026-04-01&period_end=2026-04-30"
+            "/api/budgets/intelligence?scope=all&period_start=2026-04-01&period_end=2026-04-30"
         )
         assert resp.status_code == 200
         opps = [i for i in resp.json()["insights"] if i["kind"] == "savings-opportunity"]
@@ -529,7 +535,7 @@ class TestBudgetIntelligence:
         asyncio.run(seed())
 
         resp = test_client.get(
-            "/api/budgets/intelligence?period_start=2026-07-01&period_end=2026-07-31"
+            "/api/budgets/intelligence?scope=all&period_start=2026-07-01&period_end=2026-07-31"
         )
         assert resp.status_code == 200
         waste = [i for i in resp.json()["insights"] if i["kind"] == "recurring-waste"]
@@ -586,7 +592,7 @@ class TestBudgetIntelligence:
         asyncio.run(seed())
 
         resp = test_client.get(
-            "/api/budgets/intelligence?period_start=2026-07-01&period_end=2026-07-31"
+            "/api/budgets/intelligence?scope=all&period_start=2026-07-01&period_end=2026-07-31"
         )
         assert resp.status_code == 200
         anomalies = [i for i in resp.json()["insights"] if i["kind"] == "historical-anomaly"]
@@ -607,7 +613,7 @@ class TestBudgetIntelligence:
             "label": "intel_sort_test_d",
         })
         resp = imported_data.get(
-            "/api/budgets/intelligence?period_start=2026-01-01&period_end=2026-01-31"
+            "/api/budgets/intelligence?scope=all&period_start=2026-01-01&period_end=2026-01-31"
         )
         assert resp.status_code == 200
         insights = resp.json()["insights"]

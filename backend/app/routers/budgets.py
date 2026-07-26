@@ -46,32 +46,78 @@ class RolloverAcceptRequest(BaseModel):
     to_period_end: str
 
 
-async def _get_period_income(db, period_start: str, period_end: str) -> int:
+async def _get_period_income(db, period_start: str, period_end: str, scope: str = "auto") -> int:
+    """Income for the period, on the same terms as the dashboard.
+
+    Was an unscoped ``SUM(amount_cents)``, so every account with both CSV history
+    and a Plaid twin contributed each payslip twice.
+
+    Income is the sum of the categories whose net over the window is POSITIVE —
+    the same per-category rule the dashboard applies — so the two pages agree.
+    Summing income-signed rows directly instead counts a refund inside a spending
+    category as income and overstated the figure by $1,760.51 on one month.
+    """
+    from app.services.scope import EFFECTIVE_NET_SUM, resolve_scope
+
+    scope_sql, scope_params, _eff, _note = await resolve_scope(db, scope)
     cursor = await db.execute(
-        """SELECT COALESCE(SUM(amount_cents), 0)
-           FROM transactions
-           WHERE entity_type = 'income'
-             AND posted_date >= ?
-             AND posted_date <= ?""",
-        (period_start, period_end),
+        f"""SELECT {EFFECTIVE_NET_SUM} as net
+            FROM transactions t
+            WHERE (t.entity_type IS NULL
+                   OR t.entity_type NOT IN ('transfer', 'asset_conversion', 'excluded'))
+              AND t.category_path IS NOT NULL
+              AND t.category_path != 'Uncategorized'
+              AND t.posted_date >= ? AND t.posted_date <= ?
+              {scope_sql}
+            GROUP BY t.category_path""",
+        (period_start, period_end, *scope_params),
     )
-    row = await cursor.fetchone()
-    return row[0] if row else 0
+    return sum(max(0, (r["net"] or 0)) for r in await cursor.fetchall())
 
 
-async def _get_spent_cents(db, category_path: str, period_start: str, period_end: str) -> int:
+async def _get_spent_cents(db, category_path: str, period_start: str, period_end: str,
+                           scope: str = "auto") -> int:
+    """Spend in one category for the period, on the same terms as the dashboard.
+
+    Four things were wrong here, and together they made a $1,000 grocery budget
+    read 162% over when it was 37% over:
+
+    * **No scope.** The CSV history and its Plaid twins were both counted, so
+      every figure on this page was close to double. Groceries for June 2026 came
+      out at $2,623.60 against the dashboard's $1,372.50.
+    * **``category_path LIKE 'X%'``** meant a budget on ``Other`` also swept up
+      ``Other Income``. Categories are flat and matched exactly everywhere else.
+    * **``SUM(ABS(amount_cents))`` with ``amount_cents < 0``** counted charges and
+      ignored refunds, so returning an item never reduced what the budget had
+      spent — the opposite of how every other total in the app treats a refund.
+    * **``entity_type NOT IN (…)``** is false for NULL, so rows with no
+      entity_type were silently dropped from the budget while counting elsewhere.
+
+    ``EFFECTIVE_NET_SUM`` fixes the last two together: it is the shared
+    contra-expense arithmetic, it books a refund against the period of the charge
+    it reverses, and taking the category's NET is exactly how the dashboard
+    decides what a category spent. Verified against June 2026: Groceries
+    $2,623.60 -> $1,372.50, Restaurants -> $822.59, Other -> $304.36, all three
+    now equal to the dashboard's own figure.
+    """
+    from app.services.scope import EFFECTIVE_NET_SUM, resolve_scope
+
+    scope_sql, scope_params, _eff, _note = await resolve_scope(db, scope)
     cursor = await db.execute(
-        """SELECT COALESCE(SUM(ABS(amount_cents)), 0)
-           FROM transactions
-           WHERE category_path LIKE ?
-             AND amount_cents < 0
-             AND entity_type NOT IN ('transfer', 'excluded')
-             AND posted_date >= ?
-             AND posted_date <= ?""",
-        (category_path + "%", period_start, period_end),
+        f"""SELECT {EFFECTIVE_NET_SUM} as net
+            FROM transactions t
+            WHERE t.category_path = ?
+              AND (t.entity_type IS NULL
+                   OR t.entity_type NOT IN ('transfer', 'asset_conversion', 'excluded'))
+              AND t.posted_date >= ? AND t.posted_date <= ?
+              {scope_sql}""",
+        (category_path, period_start, period_end, *scope_params),
     )
     row = await cursor.fetchone()
-    return row[0] if row else 0
+    # The category's NET, matching the dashboard: a category that netted positive
+    # over the window has spent nothing, and a refund reduces what was spent.
+    net = (row["net"] if row else 0) or 0
+    return -net if net < 0 else 0
 
 
 def _compute_color(pct_used: float) -> str:
@@ -143,7 +189,17 @@ async def list_budgets():
 
 
 @router.get("/api/budgets/status")
-async def budget_status(period: Optional[str] = Query(None), period_start: Optional[str] = Query(None), period_end: Optional[str] = Query(None)):
+async def budget_status(period: Optional[str] = Query(None), period_start: Optional[str] = Query(None),
+                       period_end: Optional[str] = Query(None),
+                       scope: Optional[str] = Query("auto")):
+    """Budget usage for a period.
+
+    ``scope`` exists here for the same reason it exists on the dashboard: the DB
+    holds the pre-Plaid CSV history alongside its Plaid twins, and an unscoped sum
+    counts twinned transactions twice. It defaults to ``auto`` (live data), so this
+    page and the dashboard now report the same spend; pass ``all`` to include the
+    CSV history.
+    """
     db = await get_db()
     try:
         cursor = await db.execute("SELECT * FROM budgets ORDER BY id")
@@ -158,7 +214,7 @@ async def budget_status(period: Optional[str] = Query(None), period_start: Optio
         else:
             ps, pe = _parse_period("month")
 
-        total_income = await _get_period_income(db, ps, pe)
+        total_income = await _get_period_income(db, ps, pe, scope)
 
         results = []
         for b in budgets:
@@ -169,7 +225,7 @@ async def budget_status(period: Optional[str] = Query(None), period_start: Optio
                 pct = b["percent"] or 0
                 target_cents = int(total_income * pct / 100.0)
 
-            spent_cents = await _get_spent_cents(db, b["category_path"], ps, pe)
+            spent_cents = await _get_spent_cents(db, b["category_path"], ps, pe, scope)
             pct_used = (spent_cents / target_cents * 100) if target_cents > 0 else 0
             color = _compute_color(pct_used)
             forecast_overrun_cents = max(0, spent_cents - target_cents)
@@ -422,6 +478,7 @@ async def _recent_txn_ids_for_category(db, category_path: str, start: str, end: 
 async def budget_intelligence(
     period_start: Optional[str] = Query(None),
     period_end: Optional[str] = Query(None),
+    scope: Optional[str] = Query("auto"),
 ):
     """Compute mid-period and cross-period budget insights.
 
@@ -455,7 +512,7 @@ async def budget_intelligence(
             target = b["amount_cents"] if b["budget_type"] == "absolute" else int(total_income * (b["percent"] or 0) / 100.0)
             if not target or target <= 0:
                 continue
-            spent = await _get_spent_cents(db, b["category_path"], ps, pe)
+            spent = await _get_spent_cents(db, b["category_path"], ps, pe, scope)
             pct_used = spent / target * 100
             if pct_used >= 100:
                 severity = "danger"
@@ -566,7 +623,7 @@ async def budget_intelligence(
             target = b["amount_cents"] if b["budget_type"] == "absolute" else int(total_income * (b["percent"] or 0) / 100.0)
             if not target or target <= 0:
                 continue
-            current_spend = await _get_spent_cents(db, b["category_path"], ps, pe)
+            current_spend = await _get_spent_cents(db, b["category_path"], ps, pe, scope)
             trail_start, trail_end = _prior_period_window(ps, pe, months_back=3)
             trailing_spend = await _category_spend_in_window(db, b["category_path"], trail_start, trail_end)
             trailing_avg = trailing_spend / 3.0

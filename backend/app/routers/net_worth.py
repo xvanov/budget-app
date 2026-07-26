@@ -268,7 +268,7 @@ async def get_net_worth():
          mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
         total_net_worth = assets - liabilities
 
-        history = await _compute_history(db, prop_val, mortgage_bal,
+        history = await _compute_history(db, accounts,
                                         mortgage_by_month, first_mortgage_month)
 
         return {
@@ -293,7 +293,7 @@ async def get_net_worth_history(
     try:
         (accounts, assets, liabilities, prop_val, mortgage_bal,
          mortgage_by_month, first_mortgage_month) = await _compute_current_balances(db)
-        history = await _compute_history(db, prop_val, mortgage_bal,
+        history = await _compute_history(db, accounts,
                                         mortgage_by_month, first_mortgage_month)
 
         if start:
@@ -309,109 +309,105 @@ async def get_net_worth_history(
         await db.close()
 
 
-async def _compute_history(db, prop_val, current_mortgage,
-                           mortgage_by_month=None, first_mortgage_month=None):
-    cursor = await db.execute(
-        "SELECT MIN(posted_date) as min_d, MAX(posted_date) as max_d FROM transactions"
-    )
-    row = await cursor.fetchone()
-    if not row or not row["min_d"]:
-        return []
+async def _compute_history(db, accounts, mortgage_by_month=None, first_mortgage_month=None):
+    """Net worth month by month, anchored on the SAME balances the headline uses.
 
-    min_date_str = row["min_d"]
-    max_date_str = row["max_d"]
+    This used to run its own unscoped ``SUM(amount_cents) GROUP BY account_id``,
+    which meant the chart and the KPI above it were computed two different ways.
+    Once the headline moved to bank-reported balances they disagreed by
+    $211,071.90 — the chart still carried the un-deduped CSV+Plaid flow sums as
+    liabilities and omitted the residence account's cash entirely. A chart that
+    contradicts the number printed above it is worse than no chart.
 
-    try:
-        start_month = datetime.strptime(min_date_str[:7], "%Y-%m")
-    except ValueError:
-        start_month = datetime(2024, 1, 1)
-    try:
-        end_month = datetime.strptime(max_date_str[:7], "%Y-%m")
-    except ValueError:
-        end_month = datetime.now()
+    So the direction is reversed: start from today's balance for each account and
+    walk BACKWARDS, undoing each month's flows. The last point therefore equals
+    the headline by construction, and earlier points are that balance less what
+    has happened since.
 
-    # Balance owed at the end of each month, from the REAL payment stream. Months
-    # between payments inherit the last known balance (carried forward below);
-    # months before the first payment get no property and no debt.
+    One honest limitation: for an account whose imported history starts mid-life,
+    back-casting past its first transaction yields a flat line at its
+    then-opening balance, because no earlier data exists. That is a gap in the
+    data, not an artefact of the arithmetic.
+    """
     mortgage_by_month = mortgage_by_month or {}
 
-    cursor = await db.execute("""
-        SELECT account_id,
-               substr(posted_date, 1, 7) as month,
-               SUM(amount_cents) as flow
-        FROM transactions
-        GROUP BY account_id, substr(posted_date, 1, 7)
-        ORDER BY month
-    """)
-    flow_rows = await cursor.fetchall()
+    cash_lines = [a for a in accounts if not str(a["id"]).endswith("::property")]
+    property_lines = [a for a in accounts if str(a["id"]).endswith("::property")]
+    if not cash_lines and not property_lines:
+        return []
 
-    monthly_flows = {}
-    for r in flow_rows:
-        m = r["month"]
-        if m not in monthly_flows:
-            monthly_flows[m] = {}
-        monthly_flows[m][r["account_id"]] = r["flow"]
+    # Which accounts are deduped to their live rows — the same rule the balances
+    # used, so the flows we undo are the flows that produced them.
+    cursor = await db.execute(
+        "SELECT DISTINCT account_id FROM transactions "
+        "WHERE source_platform IN ('plaid','manual')"
+    )
+    live_accounts = {r[0] for r in await cursor.fetchall()}
 
-    today_str = date.today().strftime("%Y-%m")
-    all_months_raw = set(r["month"] for r in flow_rows)
-    for m in mortgage_by_month:
-        if m <= today_str:
-            all_months_raw.add(m)
-    all_months = sorted(all_months_raw)
+    cursor = await db.execute(
+        """SELECT account_id, substr(posted_date, 1, 7) AS month,
+                  SUM(amount_cents) AS all_cents,
+                  SUM(CASE WHEN source_platform IN ('plaid','manual')
+                           THEN amount_cents ELSE 0 END) AS live_cents
+           FROM transactions
+           GROUP BY account_id, substr(posted_date, 1, 7)"""
+    )
+    flows = {}
+    months_seen = set()
+    for row in await cursor.fetchall():
+        aid, month = row["account_id"], row["month"]
+        if not month:
+            continue
+        months_seen.add(month)
+        cents = row["live_cents"] if aid in live_accounts else row["all_cents"]
+        flows.setdefault(aid, {})[month] = cents
 
-    accounts_meta = await _net_worth_accounts(db)
-    included = {a["account_id"] for a in accounts_meta}
+    today_month = date.today().strftime("%Y-%m")
+    months_seen |= {m for m in mortgage_by_month if m <= today_month}
+    months = sorted(m for m in months_seen if m <= today_month)
+    if not months:
+        return []
 
-    cumulative = {}
+    # Balance at the END of each month, walking back from today.
+    running = {a["id"]: int(a["balance"] or 0) for a in cash_lines}
+    balance_by_month = {}
+    for month in reversed(months):
+        balance_by_month[month] = dict(running)
+        for aid in running:
+            running[aid] -= (flows.get(aid) or {}).get(month, 0)
+
+    # Mortgage owed at each month end, carried forward between payments.
+    mortgage_running = None
+    owed_by_month = {}
+    for month in months:
+        if month in mortgage_by_month:
+            mortgage_running = mortgage_by_month[month]
+        owed_by_month[month] = mortgage_running
+
     history = []
-    # Carried forward between payment months. Starts at None so that months
-    # before the loan existed report no debt instead of today's figure.
-    running_mortgage = None
-
-    for m in all_months:
-        month_data = monthly_flows.get(m, {})
-        for aid, flow in month_data.items():
-            if aid not in included:
-                continue
-            if aid not in cumulative:
-                cumulative[aid] = 0
-            cumulative[aid] += flow
-
-        # A month with a payment sets the balance; a month without one keeps the
-        # previous balance, which is what "nothing was paid" means.
-        if m in mortgage_by_month:
-            running_mortgage = mortgage_by_month[m]
-
+    for month in months:
         assets_m = 0
         liabilities_m = 0
+        balances = balance_by_month.get(month, {})
 
-        for meta in accounts_meta:
-            cum_bal = cumulative.get(meta["account_id"], 0)
-
-            if meta["kind"] == "real_estate":
-                # The house is only an asset from the month the loan starts —
-                # before that the history was claiming both the property and its
-                # mortgage years before either existed.
-                owned = first_mortgage_month is None or m >= first_mortgage_month
-                if not owned:
-                    continue
-                assets_m += prop_val
-                liabilities_m += running_mortgage if running_mortgage is not None else 0
-            elif meta["kind"] == "credit":
-                if cum_bal < 0:
-                    liabilities_m += abs(cum_bal)
-                else:
-                    assets_m += cum_bal
+        for line in cash_lines:
+            bal = balances.get(line["id"], 0)
+            if bal >= 0:
+                assets_m += bal
             else:
-                if cum_bal >= 0:
-                    assets_m += cum_bal
-                else:
-                    liabilities_m += abs(cum_bal)
+                liabilities_m += abs(bal)
 
-        nw = assets_m - liabilities_m
+        for line in property_lines:
+            owned = first_mortgage_month is None or month >= first_mortgage_month
+            if not owned:
+                continue
+            assets_m += int(line["balance"] or 0)
+            owed = owed_by_month.get(month)
+            liabilities_m += owed if owed is not None else int(line.get("debt") or 0)
+
         history.append({
-            "date": m + "-01",
-            "value": nw,
+            "date": month + "-01",
+            "value": assets_m - liabilities_m,
             "assets": assets_m,
             "liabilities": liabilities_m,
         })
