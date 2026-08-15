@@ -436,3 +436,83 @@ async def test_an_idle_sync_does_not_re_mark_refunds(db, monkeypatch):
     assert totals["added"] == 0 and totals["updated"] == 0 and totals["removed"] == 0
     assert calls == [], "detection ran even though the sync changed nothing"
     assert "refund_pairs" not in totals
+
+
+# ------------------------------------------------ Amazon item detail on sync
+
+@pytest.mark.asyncio
+async def test_sync_attaches_amazon_item_detail_to_the_rows_it_delivered(db, monkeypatch):
+    """An Amazon charge that arrives by sync must get its item detail attached.
+
+    Nothing ran the Amazon matcher after a sync, so this only happened when
+    somebody clicked `POST /api/amazon/match`. Every Amazon charge delivered
+    since the last click stayed a bare "Amazon" with no product, no recipient and
+    a guessed category — 53 rows and $4,995 of the owner's spending, including
+    everything synced in the three weeks before they reported it.
+    """
+    item_db_id = await _seed_item(db)
+    calls = []
+
+    async def _match(db_):
+        calls.append("match")
+        return {"charges_matched": 1, "charges_unmatched": 0}
+
+    async def _split(db_, limit=0):
+        calls.append("split")
+        return {"split": 1, "children_created": 3}
+
+    from app.services import amazon_service
+
+    monkeypatch.setattr(amazon_service, "match_all", _match)
+    monkeypatch.setattr(amazon_service, "split_matched_charges", _split)
+
+    purchase = {
+        "transaction_id": "txn-amz-1", "account_id": "plaid-acct-1",
+        "date": "2026-08-13", "authorized_date": "2026-08-13",
+        "amount": 34.38, "name": "AMAZON MKTPLACE PMTS", "merchant_name": "Amazon",
+        "iso_currency_code": "USD", "pending": False,
+    }
+    totals = await plaid_sync.sync_all(
+        db, client=StubClient([page(added=[purchase], next_cursor="cur-a")]),
+        categorize=False,
+    )
+
+    assert totals["added"] == 1
+    assert calls == ["match", "split"], "matching must run, and before the split"
+    assert totals["amazon"]["charges_matched"] == 1
+    assert totals["amazon"]["children_created"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_sync_without_amazon_rows_does_not_run_the_matcher(db, monkeypatch):
+    """Matching re-derives every Amazon link in the database.
+
+    That is the right thing to do when new Amazon rows arrive and wasted work
+    when none did — and on an hourly unattended tick, work that re-decides
+    correct links for no reason is work that can only lose.
+    """
+    await _seed_item(db)
+    calls = []
+
+    async def _match(db_):
+        calls.append("match")
+        return {}
+
+    from app.services import amazon_service
+
+    monkeypatch.setattr(amazon_service, "match_all", _match)
+
+    grocery = {
+        "transaction_id": "txn-kroger-1", "account_id": "plaid-acct-1",
+        "date": "2026-08-13", "authorized_date": "2026-08-13",
+        "amount": 61.20, "name": "KROGER #442", "merchant_name": "Kroger",
+        "iso_currency_code": "USD", "pending": False,
+    }
+    totals = await plaid_sync.sync_all(
+        db, client=StubClient([page(added=[grocery], next_cursor="cur-k")]),
+        categorize=False,
+    )
+
+    assert totals["added"] == 1
+    assert calls == []
+    assert "amazon" not in totals

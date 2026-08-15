@@ -148,6 +148,98 @@ def test_normalize_merchant_collapses_variants():
     assert normalize_merchant("Lowe's") != normalize_merchant("Ulta")
 
 
+# ── Merchant identity across the names one vendor arrives under ──────────────
+
+def test_descriptor_tail_does_not_break_the_merchant_match():
+    """The reported bug: a $4,298.93 Apple purchase and its refund.
+
+    The charge arrived as merchant "Apple", the credit fifteen days later as
+    "APPLE.COM/US". Those normalize to `apple` and `applecomu`, so the old
+    equality test never compared them and the refunded purchase stayed on the
+    Expenses breakdown at its full amount.
+    """
+    pairs = find_pairs([
+        txn(1, -429893, "2026-02-22", merchant="Apple"),
+        txn(2, 429893, "2026-03-08", merchant="APPLE.COM/US"),
+    ])
+    assert [(p["charge_id"], p["credit_id"], p["partial"]) for p in pairs] == [(1, 2, False)]
+
+
+@pytest.mark.parametrize("charge_name,credit_name", [
+    ("Getqr", "GETQR.COM/US"),
+    ("Wodify Pay", "WODIFY PAY* WP CROSSFI"),
+    ("Windsor Fashions", "WINDSOR FASHIONS #350"),
+    ("Amazon: Goldshire Hydrangea Tree", "Amazon"),
+])
+def test_a_name_that_starts_with_the_other_is_the_same_vendor(charge_name, credit_name):
+    pairs = find_pairs([txn(1, -5000, "2026-03-01", merchant=charge_name),
+                        txn(2, 5000, "2026-03-05", merchant=credit_name)])
+    assert len(pairs) == 1
+
+
+def test_the_description_can_carry_the_shared_name():
+    """A processor's name on one row and the vendor's on the other.
+
+    "Square" and "Arenas Immigration" have nothing in common as merchants, but
+    both rows describe themselves as ARENAS IMMIGRATION. Reading only the
+    merchant column loses that.
+    """
+    charge = txn(1, -15000, "2026-01-16", merchant="Arenas Immigration")
+    credit = txn(2, 15000, "2026-01-22", merchant="Square")
+    credit["description"] = "ARENAS IMMIGRATION"
+    assert len(find_pairs([charge, credit])) == 1
+
+
+def test_a_shared_leading_word_is_not_a_shared_vendor():
+    """The prefix rule must not join vendors that merely start alike."""
+    assert find_pairs([txn(1, -5000, "2026-03-01", merchant="Amex Travel"),
+                       txn(2, 5000, "2026-03-05", merchant="Amethyst Spa")]) == []
+
+
+def test_a_bank_descriptor_is_not_a_merchant_name():
+    """"POS DEBIT" leads thousands of descriptions and names no vendor.
+
+    Left on the front of the key it becomes the thing the prefix rule matches
+    on, so every card purchase would look like the same merchant as every other.
+    """
+    charge = txn(1, -5000, "2026-03-01", merchant="Ulta Beauty")
+    charge["description"] = "POS DEBIT ULTA BEAUTY 1234"
+    credit = txn(2, 5000, "2026-03-05", merchant="Lowe's")
+    credit["description"] = "POS DEBIT LOWES #445"
+    assert find_pairs([charge, credit]) == []
+
+
+def test_an_exact_refund_outranks_an_earlier_partial_guess():
+    """A partial guess must not claim a charge some other credit reverses exactly.
+
+    Live case: a $475.95 Amazon charge was booked as 36% refunded by a $171.99
+    credit two weeks later, while the $475.95 credit that actually reversed it
+    sat unpaired — both credits are bare "Amazon", and the older one simply got
+    to look first.
+    """
+    rows = [
+        txn(1, -47595, "2025-08-17", merchant="Amazon"),
+        txn(2, -37416, "2025-08-08", merchant="Amazon"),
+        txn(3, 17199, "2025-09-08", merchant="Amazon"),   # older credit, partial
+        txn(4, 47595, "2025-09-22", merchant="Amazon"),   # newer credit, exact
+    ]
+    by_credit = {p["credit_id"]: p for p in find_pairs(rows)}
+    assert by_credit[4]["charge_id"] == 1 and not by_credit[4]["partial"]
+    assert by_credit[3]["charge_id"] == 2 and by_credit[3]["partial"]
+
+
+def test_a_partial_needs_the_strict_name_not_the_prefix():
+    """Two inferences do not stack.
+
+    An exact amount from a prefix-matched name is near-proof. A partial amount
+    is already a guess, so it is held to rows that literally share a name —
+    otherwise a bare "Amazon" credit can claim any Amazon item charge whose
+    total happens to be in range.
+    """
+    assert find_pairs([txn(1, -151442, "2025-12-05", merchant="Amazon: Thunderobot Laptop"),
+                       txn(2, 54017, "2025-12-31", merchant="Amazon")]) == []
+
+
 def test_thresholds_are_documented_values():
     assert REFUND_WINDOW_DAYS == 180
     assert PARTIAL_WINDOW_DAYS == 60
@@ -201,35 +293,68 @@ async def test_amazon_attributed_refund_is_paired(db):
 
 
 @pytest.mark.asyncio
-async def test_amazon_attribution_never_overwrites_an_existing_pair(db):
-    """It fills gaps only. A pair the heuristic already made must survive.
+async def test_amazon_attribution_outranks_the_heuristic(db):
+    """When Amazon says which item a credit reverses, that answer wins.
 
-    Otherwise re-running detection could move a credit from the charge it really
-    reversed onto a different one, which is how a correct pair becomes a wrong one.
+    The heuristic's evidence here looks strong — same product name, two days
+    apart, same amount — but it is still an inference from amount and date,
+    while Amazon's export NAMES the order and the item and the matcher has
+    already resolved that item to the row that paid for it.
+
+    This ordering exists because of what the heuristic looks like on Amazon in
+    particular: every refund arrives as a bare "Amazon" against hundreds of
+    candidate charges, so letting it go first meant a nearby amount could claim
+    a purchase that Amazon had explicitly tied to a different one.
     """
-    charge_id = await _insert(db, "2026-04-30", -5000, "Amazon: Widget")
-    credit_id = await _insert(db, "2026-05-02", 5000, "Amazon: Widget")
-    other_charge = await _insert(db, "2026-03-01", -5000, "Amazon: Other Thing")
+    other_credit = await _insert(db, "2026-05-02", 5000, "Amazon: Widget")
+    heuristic_charge = await _insert(db, "2026-04-30", -5000, "Amazon: Widget")
+    attributed_charge = await _insert(db, "2026-03-01", -5000, "Amazon: Other Thing")
 
     await db.execute(
         """INSERT INTO amazon_items (id, order_id, owner, product_name, total_cents,
                order_date, matched_transaction_id, split_transaction_id)
            VALUES (9002, 'order-2', 'kalin', 'Other Thing', 5000, '2026-02-27', ?, ?)""",
-        (other_charge, other_charge),
+        (attributed_charge, attributed_charge),
     )
     await db.execute(
         """INSERT INTO amazon_refunds (order_id, owner, refund_date, amount_cents,
                matched_transaction_id, matched_item_id, fingerprint)
            VALUES ('order-2', 'kalin', '2026-05-02', 5000, ?, 9002, 'fp-2')""",
-        (credit_id,),
+        (other_credit,),
     )
     await db.commit()
 
     await detect_and_store(db)
 
     cursor = await db.execute(
-        "SELECT refund_match_id FROM transactions WHERE id=?", (credit_id,))
+        "SELECT refund_match_id FROM transactions WHERE id=?", (other_credit,))
     matched = (await cursor.fetchone())["refund_match_id"]
-    assert matched == charge_id, (
-        "the same-merchant, 2-day-apart pair is the better answer; Amazon "
-        f"attribution must not steal the credit onto {other_charge}")
+    assert matched == attributed_charge, (
+        f"Amazon named the purchase; the heuristic must not move the credit "
+        f"onto {heuristic_charge}")
+
+
+@pytest.mark.asyncio
+async def test_detection_is_stable_across_reruns(db):
+    """Re-running detection must not move a credit off the charge it reversed.
+
+    The wipe-and-remark cycle runs after every sync, unattended. A pass whose
+    output depended on run order would quietly rewrite correct pairs into
+    different ones month after month, and nothing would report it.
+    """
+    charge_id = await _insert(db, "2026-04-30", -5000, "Amazon: Widget")
+    credit_id = await _insert(db, "2026-05-02", 5000, "Amazon: Widget")
+    await _insert(db, "2026-03-01", -5000, "Amazon: Widget")
+    await db.commit()
+
+    await detect_and_store(db)
+    cursor = await db.execute(
+        "SELECT refund_match_id FROM transactions WHERE id=?", (credit_id,))
+    first = (await cursor.fetchone())["refund_match_id"]
+    assert first == charge_id, "the closest same-merchant charge is the answer"
+
+    for _ in range(2):
+        await detect_and_store(db)
+        cursor = await db.execute(
+            "SELECT refund_match_id FROM transactions WHERE id=?", (credit_id,))
+        assert (await cursor.fetchone())["refund_match_id"] == first

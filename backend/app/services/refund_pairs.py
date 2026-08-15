@@ -12,7 +12,7 @@ visibility and filtering.
 Matching is deliberately conservative — a wrong pair hides two real transactions
 from view:
 
-  * same normalized merchant,
+  * same merchant, judged by ``same_merchant`` below,
   * the credit is not larger than the charge,
   * the credit lands on or after the charge date, within REFUND_WINDOW_DAYS,
   * one-to-one: a charge can be reversed once, a credit reverses one charge,
@@ -43,13 +43,75 @@ PARTIAL_WINDOW_DAYS = 60
 # Categories whose rows are internal movement or opted out; never refund pairs.
 SKIP_ENTITY_TYPES = ("transfer", "asset_conversion", "excluded")
 
+# A shorter key is accepted as the same merchant when the longer one STARTS with
+# it — "apple" inside "applecomus" — but only once it is specific enough to be a
+# name rather than a fragment. Below five characters the rule starts joining
+# unrelated vendors that happen to share an opening syllable.
+MIN_PREFIX_KEY_LEN = 5
+
+# Descriptors the bank puts in FRONT of the merchant name. Left in place they
+# become the start of the key, so the prefix rule would read them as the
+# merchant: every "POS DEBIT …" row would look like the same vendor as every
+# other. Stripped, the real name leads the key.
+_DESCRIPTOR_PREFIX_RE = re.compile(
+    r"^(pos\s+debit|pos\s+purchase|debit\s+card\s+purchase|card\s+purchase|"
+    r"purchase\s+authorized\s+on|recurring\s+payment|checkcard|ccd|sq|tst|"
+    r"paypal|pp|ach\s+(debit|credit)|electronic\s+(debit|credit))[\s*#:-]+",
+    re.IGNORECASE,
+)
+
 
 def normalize_merchant(name: Optional[str]) -> str:
     """Same-merchant test that survives spelling drift between charge and credit."""
     text = (name or "").lower()
+    text = _DESCRIPTOR_PREFIX_RE.sub("", text)
     text = re.sub(r"[^a-z0-9]+", "", text)
     text = re.sub(r"(com|net|org|inc|llc)$", "", text)
     return re.sub(r"s$", "", text) or "unknown"
+
+
+def merchant_keys(row: Dict[str, Any]) -> List[str]:
+    """Every name a row could be known by — its merchant AND its description.
+
+    The old test read ``merchant or description``, which meant a row with any
+    merchant at all was judged on that one string. Real feeds do not cooperate:
+    the owner's $4,298.93 Apple purchase arrived as merchant "Apple" and its
+    refund fifteen days later as merchant "APPLE.COM/US", so the two normalized
+    to ``apple`` and ``applecomu`` and were never compared. Both rows carry
+    "APPLE.COM/US" in the description, which is exactly the evidence that they
+    are one vendor. Keeping both names per row is what lets either one match.
+    """
+    keys: List[str] = []
+    for text in (row.get("merchant"), row.get("description")):
+        key = normalize_merchant(text)
+        if key and key != "unknown" and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def same_merchant(a_keys: List[str], b_keys: List[str]) -> bool:
+    """Do these two rows name the same vendor?
+
+    Equal keys, or one key being the start of the other. The prefix arm is what
+    survives the descriptor tails banks append to a name — "Getqr" vs
+    "GETQR.COM/US", "Wodify Pay" vs "WODIFY PAY* WP CROSSFI", "Windsor Fashions"
+    vs "WINDSOR FASHIONS #350" — and what lets a bare "Amazon" credit reach the
+    "Amazon: <product>" purchase the item matcher renamed.
+
+    It is deliberately one-directional (starts-with, never contains). Substring
+    matching looked tempting and is not safe here: Amazon product descriptions
+    routinely name other vendors ("…Works with Apple Find My…"), so a contains
+    rule would let an Amazon item's description claim an Apple refund.
+    """
+    for a in a_keys:
+        for b in b_keys:
+            if a == b:
+                return True
+            if len(a) < MIN_PREFIX_KEY_LEN or len(b) < MIN_PREFIX_KEY_LEN:
+                continue
+            if a.startswith(b) or b.startswith(a):
+                return True
+    return False
 
 
 def economic_date(row: Dict[str, Any]) -> Optional[str]:
@@ -76,12 +138,21 @@ def _days_between(later: Optional[str], earlier: Optional[str]) -> Optional[int]
     return (a - b).days
 
 
-def find_pairs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def find_pairs(rows: List[Dict[str, Any]],
+               already_paired: Optional[set] = None) -> List[Dict[str, Any]]:
     """Pure pairing over a list of transactions. Returns pair dicts.
 
     Kept free of DB access so the matching rules are unit-testable on their own.
+
+    ``already_paired`` names rows a better-informed pass has already settled —
+    in practice Amazon's own refund attribution, which knows which order and
+    which item a credit reverses. Those rows are left alone rather than
+    re-decided by amount and date.
     """
-    charges: Dict[str, List[Dict[str, Any]]] = {}
+    claimed_charges: set = set(already_paired or ())
+    claimed_credits: set = set(already_paired or ())
+
+    charges: List[Dict[str, Any]] = []
     credits: List[Dict[str, Any]] = []
 
     for row in rows:
@@ -89,56 +160,82 @@ def find_pairs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
         amount = int(row.get("amount_cents") or 0)
         if amount < 0:
-            charges.setdefault(normalize_merchant(row.get("merchant") or row.get("description")), []).append(row)
+            charges.append(row)
         elif amount > 0:
             credits.append(row)
 
-    claimed_charges: set = set()
-    pairs: List[Dict[str, Any]] = []
+    keys_by_id = {row["id"]: merchant_keys(row) for row in charges}
+    keys_by_id.update({row["id"]: merchant_keys(row) for row in credits})
 
-    # Oldest credit first so an early refund claims the charge it actually undid.
-    for credit in sorted(credits, key=lambda r: (economic_date(r) or "", r.get("id") or 0)):
-        key = normalize_merchant(credit.get("merchant") or credit.get("description"))
-        credit_amount = int(credit["amount_cents"])
-        candidates = []
-        for charge in charges.get(key, []):
-            if charge["id"] in claimed_charges:
+    def pass_over(exact: bool) -> List[Dict[str, Any]]:
+        """One sweep: oldest credit first, so an early refund claims the charge
+        it actually undid."""
+        found: List[Dict[str, Any]] = []
+        for credit in sorted(credits, key=lambda r: (economic_date(r) or "", r.get("id") or 0)):
+            if credit["id"] in claimed_credits:
                 continue
-            charge_amount = abs(int(charge["amount_cents"]))
-            if credit_amount > charge_amount:
-                continue  # a credit bigger than the charge is not that charge's refund
-            # Economic dates, not settlement dates — see economic_date().
-            gap = _days_between(economic_date(credit), economic_date(charge))
-            if gap is None or gap < 0 or gap > REFUND_WINDOW_DAYS:
+            credit_keys = keys_by_id[credit["id"]]
+            credit_amount = int(credit["amount_cents"])
+            candidates = []
+            for charge in charges:
+                if charge["id"] in claimed_charges:
+                    continue
+                charge_amount = abs(int(charge["amount_cents"]))
+                if credit_amount > charge_amount:
+                    continue  # more back than was paid: not this charge's refund
+                if exact != (credit_amount == charge_amount):
+                    continue
+                charge_keys = keys_by_id[charge["id"]]
+                # A partial is already an inference, so it is held to the strict
+                # identity: the two rows must literally share a name. The prefix
+                # arm is reserved for exact amounts, where the amount is doing
+                # most of the proving. Compounding a loose name with a guessed
+                # amount is how a $540 credit ends up hiding a $1,514 laptop it
+                # had nothing to do with.
+                if exact:
+                    if not same_merchant(credit_keys, charge_keys):
+                        continue
+                elif not set(credit_keys) & set(charge_keys):
+                    continue
+                # Economic dates, not settlement dates — see economic_date().
+                gap = _days_between(economic_date(credit), economic_date(charge))
+                if gap is None or gap < 0 or gap > REFUND_WINDOW_DAYS:
+                    continue
+                if not exact:
+                    if gap > PARTIAL_WINDOW_DAYS:
+                        continue
+                    if credit_amount / charge_amount < PARTIAL_MIN_RATIO:
+                        continue
+                candidates.append((gap, charge))
+
+            if not candidates:
                 continue
-            is_partial = charge_amount != credit_amount
-            if is_partial:
-                if gap > PARTIAL_WINDOW_DAYS:
-                    continue
-                if credit_amount / charge_amount < PARTIAL_MIN_RATIO:
-                    continue
-            candidates.append((gap, is_partial, charge))
+            # Closest date, then id so two identical charges resolve the same way
+            # on every run rather than however the rows happened to arrive.
+            candidates.sort(key=lambda c: (c[0], c[1]["id"]))
+            gap, charge = candidates[0]
+            claimed_charges.add(charge["id"])
+            claimed_credits.add(credit["id"])
+            found.append({
+                "charge_id": charge["id"],
+                "credit_id": credit["id"],
+                "charge_cents": int(charge["amount_cents"]),
+                "credit_cents": credit_amount,
+                "partial": not exact,
+                "days_to_refund": gap,
+                "merchant": charge.get("merchant") or credit.get("merchant") or "",
+                "category_path": charge.get("category_path"),
+                "charge_date": charge.get("posted_date"),
+                "credit_date": credit.get("posted_date"),
+            })
+        return found
 
-        if not candidates:
-            continue
-        # Prefer an exact-amount match, then the closest date.
-        candidates.sort(key=lambda c: (c[1], c[0]))
-        gap, is_partial, charge = candidates[0]
-        claimed_charges.add(charge["id"])
-        pairs.append({
-            "charge_id": charge["id"],
-            "credit_id": credit["id"],
-            "charge_cents": int(charge["amount_cents"]),
-            "credit_cents": credit_amount,
-            "partial": bool(is_partial),
-            "days_to_refund": gap,
-            "merchant": charge.get("merchant") or credit.get("merchant") or "",
-            "category_path": charge.get("category_path"),
-            "charge_date": charge.get("posted_date"),
-            "credit_date": credit.get("posted_date"),
-        })
-
-    return pairs
+    # Every exact refund is settled before any partial is guessed at. Within one
+    # sweep the oldest credit went first, which let an early partial guess claim
+    # a charge that a later credit reversed to the penny: the owner's $475.95
+    # Amazon charge was booked as 36% refunded by a $171.99 credit while the
+    # $475.95 credit that actually reversed it sat unpaired two weeks later.
+    return pass_over(exact=True) + pass_over(exact=False)
 
 
 def reconcile_exact(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -300,7 +397,7 @@ async def reconcile_merchant(db, pattern: str, scope: Optional[str] = "plaid",
 
 
 
-async def _pair_amazon_attributed_refunds(db, scope_sql: str) -> int:
+async def _pair_amazon_attributed_refunds(db, scope_sql: str) -> Dict[str, Any]:
     """Pair refunds the AMAZON EXPORT has already attributed to a purchase.
 
     Amazon tells us, per refund, which order and which item it reverses — and the
@@ -315,9 +412,11 @@ async def _pair_amazon_attributed_refunds(db, scope_sql: str) -> int:
     returned 2026-05-15 made April overstate spending by $163.38 and May show
     $163.38 of income that was never earned.
 
-    Only fills gaps: a row already paired (by ``find_pairs`` above, or by a vendor
-    reconciliation) is left exactly as it is. Runs after the heuristic pass for that
-    reason.
+    Runs FIRST, before the heuristic, and returns the rows it claimed so
+    ``find_pairs`` can leave them alone. Amazon is the merchant where the
+    heuristic is weakest — every credit arrives as a bare "Amazon" against
+    hundreds of candidate charges — so wherever Amazon has told us the answer,
+    the guess does not get a vote.
     """
     cursor = await db.execute(
         f"""SELECT ar.matched_transaction_id AS credit_id,
@@ -365,8 +464,8 @@ async def _pair_amazon_attributed_refunds(db, scope_sql: str) -> int:
         marked += 1
 
     if marked:
-        logger.info("Paired %d Amazon-attributed refund(s) the heuristic pass missed", marked)
-    return marked
+        logger.info("Paired %d refund(s) from Amazon's own attribution", marked)
+    return {"pairs": marked, "claimed_ids": claimed}
 
 
 async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]:
@@ -381,8 +480,6 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
             WHERE linked_transaction_id IS NULL {scope_sql}"""
     )
     rows = [dict(r) for r in await cursor.fetchall()]
-
-    pairs = find_pairs(rows)
 
     # Clear previous marks before re-marking, so an unpaired row does not keep a
     # stale flag forever. Two conditions on this wipe, each of which cost real
@@ -412,6 +509,11 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
               )"""
     )
 
+    # Amazon's own attribution first — it KNOWS which item a credit reverses,
+    # and the rows it settles are then off the table for the heuristic below.
+    amazon = await _pair_amazon_attributed_refunds(db, scope_sql)
+
+    pairs = find_pairs(rows, already_paired=amazon["claimed_ids"])
     for pair in pairs:
         await db.execute(
             "UPDATE transactions SET refund_match_id=?, refund_role='charge', refund_partial=? WHERE id=?",
@@ -421,8 +523,6 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
             "UPDATE transactions SET refund_match_id=?, refund_role='credit', refund_partial=? WHERE id=?",
             (pair["charge_id"], 1 if pair["partial"] else 0, pair["credit_id"]),
         )
-
-    amazon_pairs = await _pair_amazon_attributed_refunds(db, scope_sql)
     await db.commit()
 
     full = sum(1 for p in pairs if not p["partial"])
@@ -432,7 +532,7 @@ async def detect_and_store(db, scope: Optional[str] = "plaid") -> Dict[str, Any]
         "full_refunds": full,
         "partial_refunds": len(pairs) - full,
         "refunded_value_cents": sum(p["credit_cents"] for p in pairs),
-        "amazon_attributed_pairs": amazon_pairs,
+        "amazon_attributed_pairs": amazon["pairs"],
     }
 
     # Re-apply every vendor reconciliation the owner has done. The wipe above is

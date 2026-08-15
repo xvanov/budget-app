@@ -54,7 +54,28 @@ async def amazon_status():
             "ON t.id = r.matched_transaction_id WHERE t.refund_match_id IS NOT NULL"
         )
 
+        # How far the export reaches, and what has been bought since. An export is
+        # a manual download that goes stale the day it is taken: charges after the
+        # last order in it CANNOT be matched, no matter how often matching runs,
+        # because the data that would explain them does not exist yet. Without
+        # this the app reports those rows as "unmatched" beside the ones it
+        # genuinely failed on, and the one with an obvious fix looks like a bug.
+        covered_through = await scalar(
+            "SELECT MAX(COALESCE(ship_date, order_date)) FROM amazon_items"
+        )
+        charges_after_export = 0
+        if covered_through:
+            rows = await amazon_service._amazon_transactions(db)
+            charges_after_export = sum(
+                1 for r in rows
+                if (r["amount_cents"] or 0) < 0
+                and (r["posted_date"] or "") > covered_through
+                and not (r.get("merchant") or "").startswith("Amazon:")
+            )
+
         return {
+            "export_covers_orders_through": covered_through,
+            "charges_after_export_coverage": charges_after_export,
             "exports_on_disk": sorted(discover_owner_exports(amazon_service.AMAZON_DIR).keys()),
             "owners": owners,
             "items": items,

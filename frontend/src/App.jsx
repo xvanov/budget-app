@@ -3703,6 +3703,9 @@ function CategoryDrillDown({ category, isIncome, periodId, expectedCents, onClos
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [limit, setLimit] = useState(100)
+  // Refunded purchases are left out by default — they are not spending, and the
+  // total above already counts them as nothing. This puts them back on demand.
+  const [showRefunded, setShowRefunded] = useState(false)
 
   useEffect(() => {
     let live = true
@@ -3718,12 +3721,13 @@ function CategoryDrillDown({ category, isIncome, periodId, expectedCents, onClos
       sort: 'abs_amount',
       dir: 'desc',
       page_size: String(limit),
+      include_refunded: showRefunded ? 'true' : 'false',
     })
     apiFetch(`/dashboard/category-detail?${qs}`)
       .then(d => { if (live) { setData(d); setLoading(false) } })
       .catch(e => { if (live) { setError(e.message); setLoading(false) } })
     return () => { live = false }
-  }, [category, periodId, limit])
+  }, [category, periodId, limit, showRefunded])
 
   const shown = data?.transactions || []
   // The drill-down selects exactly the rows the breakdown counted, so these two
@@ -3755,6 +3759,23 @@ function CategoryDrillDown({ category, isIncome, periodId, expectedCents, onClos
           gap is a bug, not a rounding artefact.
         </div>
       )}
+      {/* A shorter list than expected must never be silent about why. */}
+      {(data?.refunded_hidden_count > 0 || showRefunded) && (
+        <div style={{margin:'0 14px 8px', fontSize:12, color:'var(--muted-foreground)',
+                     display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+          {showRefunded ? (
+            <span>Refunded purchases are listed. They cost nothing, so they add nothing to this total.</span>
+          ) : (
+            <span>
+              {data.refunded_hidden_count} refunded purchase{data.refunded_hidden_count === 1 ? '' : 's'} not
+              listed — {fmtCurrency(data.refunded_hidden_cents)} went out and came back.
+            </span>
+          )}
+          <button className="btn btn--ghost btn--sm" onClick={() => setShowRefunded(v => !v)}>
+            {showRefunded ? 'Hide refunded' : 'Show them'}
+          </button>
+        </div>
+      )}
 
       <div style={{overflow:'auto', maxHeight:460}}>
         <table className="tbl">
@@ -3771,15 +3792,33 @@ function CategoryDrillDown({ category, isIncome, periodId, expectedCents, onClos
                 <td className="mono" style={{width:80, whiteSpace:'nowrap', fontSize:12, color:'var(--muted-foreground)'}}>
                   {t.posted_date || ''}
                 </td>
-                <td style={{fontWeight:500}}>{t.merchant || '—'}</td>
+                <td style={{fontWeight:500}}>
+                  {t.merchant || '—'}
+                  {t.refund_match_id ? (
+                    <span className="chip" style={{marginLeft:6}}
+                          title={t.refund_role === 'credit'
+                            ? 'The refund of an earlier purchase — counted at that purchase'
+                            : (t.refund_partial ? 'Partly refunded later' : 'Refunded in full later')}>
+                      {t.refund_role === 'credit' ? 'refund' : t.refund_partial ? 'part refunded' : 'refunded'}
+                    </span>
+                  ) : null}
+                </td>
                 <td style={{fontSize:12, color:'var(--muted-foreground)', maxWidth:260,
                             overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}
                     title={t.description || ''}>
                   {t.description || '—'}
                 </td>
                 <td style={{fontSize:12, color:'var(--muted-foreground)'}}>{t.account_id || ''}</td>
+                {/* The row shows what was charged; when a refund means it counted
+                    for less, the amount that actually landed in this total sits
+                    under it rather than being silently different. */}
                 <td className={`text-right mono ${t.amount_cents >= 0 ? 'amt-pos' : 'amt-neg'}`}>
                   {fmtSignedCurrency(t.amount_cents)}
+                  {t.effective_amount_cents != null && t.effective_amount_cents !== t.amount_cents && (
+                    <div style={{fontSize:11, color:'var(--muted-foreground)'}}>
+                      counts as {fmtSignedCurrency(t.effective_amount_cents)}
+                    </div>
+                  )}
                 </td>
               </tr>
             ))}
@@ -5356,6 +5395,17 @@ function AccountsPage() {
               <KpiCard label="Split rows" value={String(amazon?.items_split ?? 0)} color="#facc15"/>
               <KpiCard label="Refunds" value={`${amazon?.refunds_matched ?? 0}/${amazon?.refunds ?? 0}`} color="#94a3b8"/>
               <KpiCard label="Refunded back" value={fmtCurrency(amazon?.matched_refund_value_cents || 0)} color="#4ade80"/>
+            </div>
+          )}
+          {/* An export goes stale the day it is downloaded. Charges made after
+              the last order in it can never be matched — say so, rather than
+              filing them with the ones that genuinely failed to match. */}
+          {amazon?.charges_after_export_coverage > 0 && (
+            <div className="msg-banner" style={{marginTop:12}}>
+              {amazon.charges_after_export_coverage} Amazon charge
+              {amazon.charges_after_export_coverage === 1 ? '' : 's'} post-date this export,
+              which stops at {amazon.export_covers_orders_through}. Download a fresh{' '}
+              <code>Your Orders.zip</code> and Import to give them their item detail.
             </div>
           )}
           <div className="subtitle" style={{marginTop:16}}>

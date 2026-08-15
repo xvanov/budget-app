@@ -447,11 +447,11 @@ def test_the_drill_down_explains_a_moved_number(seeded, test_client):
     """
     detail = test_client.get(
         "/api/dashboard/category-detail?path=Home Improvement"
-        "&start_date=2031-06-01&end_date=2031-06-30&page_size=50")
+        "&start_date=2031-06-01&end_date=2031-06-30&page_size=50&include_refunded=true")
     assert detail.status_code == 200, detail.text
     body = detail.json()
-    # June still lists the purchase, but it no longer counts: the July refund is
-    # applied here, at the charge.
+    # Asked for explicitly, June shows the purchase — and shows that it counts for
+    # nothing, because the July refund is applied here, at the charge.
     assert body["raw_net_cents"] == CHARGE_FULL, body
     assert body["net_cents"] == 0, body
     by_id = {t["id"]: t for t in body["transactions"]}
@@ -473,3 +473,68 @@ def test_a_partial_refund_leaves_the_outstanding_amount_in_the_charge_month_dril
     body = detail.json()
     assert body["raw_net_cents"] == CHARGE_PARTIAL, body
     assert body["net_cents"] == CHARGE_PARTIAL + CREDIT_PARTIAL, body
+
+
+# ------------------------------------------- a refunded purchase is not spending
+
+def test_a_refunded_purchase_is_not_listed_under_expenses(seeded, test_client):
+    """The owner's report: a purchase that came back still sat in the breakdown.
+
+    A $4,298.93 Apple charge, refunded in full six weeks earlier, was listed in
+    the Expenses drill-down at its full amount — the same row, in the same place,
+    as money genuinely spent. It contributed nothing to the total, which made it
+    worse rather than better: the list did not add up to the number above it and
+    nothing on the page said why.
+    """
+    detail = test_client.get(
+        "/api/dashboard/category-detail?path=Home Improvement"
+        f"&start_date={START}&end_date={END}&page_size=50")
+    body = detail.json()
+    listed = {t["id"] for t in body["transactions"]}
+    assert seeded["charge_full"] not in listed, "the refunded purchase is not spending"
+    assert seeded["credit_full"] not in listed, "nor is the credit that reversed it"
+    assert body["total"] == 0
+    # Withheld, not dropped: the page can say what it is not showing.
+    assert body["refunded_hidden_count"] == 2
+    assert body["refunded_hidden_cents"] == -CHARGE_FULL
+
+
+def test_hiding_refunds_does_not_move_the_total(seeded, test_client):
+    """A hidden row contributed 0, so the number it drills into cannot change."""
+    shown = test_client.get(
+        "/api/dashboard/category-detail?path=Home Improvement"
+        f"&start_date={START}&end_date={END}&include_refunded=true").json()
+    hidden = test_client.get(
+        "/api/dashboard/category-detail?path=Home Improvement"
+        f"&start_date={START}&end_date={END}").json()
+    assert hidden["net_cents"] == shown["net_cents"] == 0
+    assert hidden["raw_net_cents"] == shown["raw_net_cents"]
+    assert len(shown["transactions"]) == 2 and hidden["transactions"] == []
+
+
+def test_a_partially_refunded_purchase_is_still_listed(seeded, test_client):
+    """$70 of that $100 was really spent, so the row stays — at what it came to.
+
+    Only rows that cost nothing drop out. Hiding a partial would take real
+    spending off the page.
+    """
+    body = test_client.get(
+        "/api/dashboard/category-detail?path=Shopping"
+        f"&start_date={START}&end_date={END}&page_size=50").json()
+    by_id = {t["id"]: t for t in body["transactions"]}
+    charge = by_id.get(seeded["charge_partial"])
+    assert charge is not None, "a partly refunded purchase is still spending"
+    assert charge["amount_cents"] == CHARGE_PARTIAL
+    assert charge["effective_amount_cents"] == CHARGE_PARTIAL + CREDIT_PARTIAL
+    # Its credit contributes nothing here — it was applied at the charge above.
+    assert seeded["credit_partial"] not in by_id
+    assert body["refunded_hidden_count"] == 1
+    assert body["net_cents"] == CHARGE_PARTIAL + CREDIT_PARTIAL
+
+
+def test_an_unrefunded_expense_is_never_hidden(seeded, test_client):
+    body = test_client.get(
+        "/api/dashboard/category-detail?path=Groceries"
+        f"&start_date={START}&end_date={END}&page_size=50").json()
+    assert [t["id"] for t in body["transactions"]] == [seeded["plain"]]
+    assert body["refunded_hidden_count"] == 0

@@ -1450,6 +1450,7 @@ async def get_dashboard_category_detail(
     sort: str = "posted_date",
     dir: str = "desc",
     scope: Optional[str] = "auto",
+    include_refunded: bool = False,
 ):
     """The transactions behind one category total.
 
@@ -1464,6 +1465,18 @@ async def get_dashboard_category_detail(
     * **Scope.** The dashboard restricts rows to the live accounts; this did not,
       so superseded CSV rows showed up under a Plaid-scoped total.
     * **Transfers / excluded.** The dashboard leaves those out of every total.
+
+    **Refunded purchases are not listed.** A purchase that came back is not
+    spending, and the breakdown above already knows it: both halves of a wash
+    contribute 0 to the category. Listing them anyway is what the owner hit — a
+    $4,298.93 Apple charge sitting in the Expenses drill-down months after it had
+    been refunded in full, indistinguishable from money actually spent. They are
+    hidden, not dropped: the response counts what it withheld, ``/api/refunded``
+    lists every pair, and ``include_refunded=true`` puts them back.
+
+    Only rows that contribute NOTHING are hidden. A partially refunded purchase
+    still cost the owner the outstanding part, so it stays listed at what it
+    really came to.
 
     ``sort=abs_amount`` orders by magnitude, which is what "biggest first" means
     for spending: expenses are negative, so a plain descending sort on
@@ -1500,8 +1513,16 @@ async def get_dashboard_category_detail(
             params.append(end_date)
 
         # resolve_scope returns a fragment that already begins with " AND ".
-        where = "WHERE " + " AND ".join(clauses) + scope_sql
+        counted_where = "WHERE " + " AND ".join(clauses) + scope_sql
         params = params + list(scope_params)
+
+        # A washed-out row is one in a refund pair whose effective amount is 0:
+        # the credit half (applied at its charge) and a fully refunded charge.
+        # Keyed off the effective amount rather than ``refund_role`` so the two
+        # can never disagree — this is the same expression the totals use.
+        washed_out = (f"(t.refund_match_id IS NOT NULL "
+                      f"AND ({effective_amount_sql('t')}) = 0)")
+        where = counted_where if include_refunded else f"{counted_where} AND NOT {washed_out}"
 
         cursor = await db.execute(f"SELECT COUNT(*) as total FROM transactions t {where}", params)
         total_row = await cursor.fetchone()
@@ -1513,15 +1534,30 @@ async def get_dashboard_category_detail(
         # started being applied at their charge: Shopping read $12,532.04 on the
         # breakdown and $12,891.06 in the drill-down, a $359.02 gap that is exactly
         # the refunds whose credit falls in another month.
+        #
+        # Summed over ``counted_where`` — every row the breakdown counted, hidden
+        # ones included. They contribute 0 by definition so the net is identical
+        # either way, but this keeps the number anchored to the dashboard's row
+        # set rather than to whatever the list happens to be showing.
         cursor = await db.execute(
             f"SELECT COALESCE(SUM({effective_amount_sql('t')}), 0), "
             f"       COALESCE(SUM(t.amount_cents), 0) "
-            f"FROM transactions t {where}",
+            f"FROM transactions t {counted_where}",
             params,
         )
         net_row = await cursor.fetchone()
         net_cents = net_row[0] or 0
         raw_net_cents = net_row[1] or 0
+
+        # What was withheld, so a shorter list than expected is explained on the
+        # page rather than looking like rows went missing.
+        cursor = await db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN t.amount_cents < 0 "
+            f"       THEN -t.amount_cents ELSE 0 END), 0) "
+            f"FROM transactions t {counted_where} AND {washed_out}",
+            params,
+        )
+        hidden_row = await cursor.fetchone()
 
         # ``effective_amount_cents`` per row, so the UI can show WHY a listed
         # amount does not contribute what it appears to — a refunded charge is
@@ -1544,6 +1580,11 @@ async def get_dashboard_category_detail(
             # The un-attributed sum, so a caller can show the difference rather
             # than wonder about it.
             "raw_net_cents": raw_net_cents,
+            # Refunded purchases left out of the list above (0 when they are
+            # included). The value is the original outlay that came back.
+            "refunded_hidden_count": hidden_row[0] if hidden_row else 0,
+            "refunded_hidden_cents": hidden_row[1] if hidden_row else 0,
+            "include_refunded": bool(include_refunded),
             "page": page,
             "page_size": page_size,
             "scope": effective_scope,

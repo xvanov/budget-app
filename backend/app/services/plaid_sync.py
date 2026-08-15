@@ -345,6 +345,46 @@ async def sync_all(db, client=None, categorize: bool = True) -> Dict[str, Any]:
             logger.warning("Post-sync categorization failed: %s", exc)
             totals["errors"].append({"stage": "categorize", "error": str(exc)[:200]})
 
+    # Amazon item detail, for the rows this sync just delivered. A bank feed says
+    # "Amazon $34.38" and nothing more; the item detail — what was bought, for
+    # whom, in which category — comes from the Amazon export, and attaching it is
+    # what turns that row into "Amazon: Fresh Step Cat Litter" or splits a
+    # multi-item order into the things it actually paid for.
+    #
+    # Nothing ran this after a sync, so it only ever happened when a human clicked
+    # POST /api/amazon/match. Every Amazon charge that arrived since the last click
+    # stayed a bare "Amazon" indefinitely — 53 rows and $4,995 of the owner's
+    # spending, including everything synced in the preceding three weeks.
+    #
+    # Runs BEFORE refund pairing, and only when this sync brought in Amazon rows:
+    # matching renames and splits the very rows pairing then has to reason about,
+    # and it resolves which item each Amazon refund reverses, which is the
+    # authoritative input `detect_and_store` prefers over its own heuristic.
+    if new_ids:
+        from app.services.amazon_matcher import is_amazon_transaction
+
+        placeholders = ",".join("?" * len(new_ids))
+        cursor = await db.execute(
+            f"SELECT merchant, description FROM transactions WHERE id IN ({placeholders})",
+            new_ids,
+        )
+        has_amazon = any(is_amazon_transaction(r[0], r[1]) for r in await cursor.fetchall())
+        if has_amazon:
+            from app.services import amazon_service
+
+            try:
+                match = await amazon_service.match_all(db)
+                split = await amazon_service.split_matched_charges(db)
+                totals["amazon"] = {
+                    "charges_matched": match.get("charges_matched", 0),
+                    "charges_unmatched": match.get("charges_unmatched", 0),
+                    "charges_split": split.get("split", 0),
+                    "children_created": split.get("children_created", 0),
+                }
+            except Exception as exc:
+                logger.warning("Post-sync Amazon matching failed: %s", exc)
+                totals["errors"].append({"stage": "amazon", "error": str(exc)[:200]})
+
     # Refund pairing. Without this a refund Plaid delivers is a standalone credit
     # until somebody remembers to POST /api/refunds/detect: category totals are
     # right either way (a positive amount nets against its own category), but the
