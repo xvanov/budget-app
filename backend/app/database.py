@@ -304,6 +304,22 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_integration_changes_item
                 ON integration_changes(item_db_id, seq);
 
+            -- Campaign facts pushed from BonusPilot: account opened, bonus received,
+            -- safe-to-close date. external_key is stable per fact, so a re-push
+            -- updates the row instead of adding another one.
+            CREATE TABLE IF NOT EXISTS campaign_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_key TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                occurred_on TEXT NOT NULL,
+                amount_cents INTEGER,
+                account_ref TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
             -- ── Amazon ───────────────────────────────────────────────────────
             -- owner exists because the Amazon account is shared and each
             -- person's export arrives separately; the export carries no

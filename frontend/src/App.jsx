@@ -688,6 +688,8 @@ function Dashboard({ periodId, onNavigate }) {
       {/* Net worth. It lived on its own route with no way to navigate to it, so
           the figures were effectively invisible; the owner asked for them here.
           Deliberately NOT period-scoped: a balance is as-of-today, not a window. */}
+      <BanksCard onNavigate={onNavigate} />
+
       <NetWorthSummary />
 
       {drillCategory && drillData && (
@@ -750,6 +752,81 @@ function Dashboard({ periodId, onNavigate }) {
 // it. Linked accounts report a real balance; unlinked ones can only contribute the
 // net of their imported transactions, and `balance_confidence` says which is which
 // so the total is never more precise-looking than it deserves.
+/**
+ * Banks & cash: each linked bank with its accounts, balances and campaign
+ * facts, plus the cash total. Balances come from the bank feed, so the card
+ * shows nothing rather than a guess when there is no linked bank yet.
+ */
+function BanksCard({ onNavigate }) {
+  const { dataVersion } = useContext(AppContext)
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState(null)
+
+  useEffect(() => {
+    apiFetch('/banks')
+      .then(d => { setData(d); setErr(null) })
+      .catch(e => setErr(String(e.message || e)))
+  }, [dataVersion])
+
+  if (err) return null
+  if (!data || !data.institutions || data.institutions.length === 0) return null
+
+  const accountCount = data.institutions.reduce((n, i) => n + i.accounts.length, 0)
+
+  return (
+    <div className="card">
+      <div className="section-head" style={{padding:'16px 20px 0'}}>
+        <div>
+          <div className="h">Banks &amp; cash</div>
+          <div className="sub">
+            As of {data.as_of} · {data.institutions.length} banks · {accountCount} accounts · cards owed {fmtCurrency(data.owed_cents, {full:true})}
+          </div>
+        </div>
+        <div style={{textAlign:'right'}}>
+          <div className="mono amt-pos" style={{fontSize:20, fontWeight:600}}>{fmtCurrency(data.cash_total_cents, {full:true})}</div>
+          <div className="sub">cash available</div>
+        </div>
+      </div>
+      {data.institutions.map(inst => (
+        <div key={inst.item_id} style={{padding:'12px 20px', borderTop:'1px solid var(--border)'}}>
+          <div style={{display:'flex', justifyContent:'space-between', alignItems:'baseline', gap:12}}>
+            <div style={{fontWeight:600}}>
+              {inst.institution_name}
+              {inst.status !== 'ACTIVE' && <span className="sub"> · needs attention ({inst.status})</span>}
+            </div>
+            <div className="mono" style={{fontSize:13}}>{fmtCurrency(inst.total_cents, {full:true})} cash</div>
+          </div>
+          <table className="tbl" style={{marginTop:6}}>
+            <tbody>
+              {inst.accounts.map(a => (
+                <tr key={a.plaid_account_id}>
+                  <td>
+                    <div style={{fontWeight:500}}>{a.name}{a.mask ? ` ···${a.mask}` : ''}</div>
+                    <div style={{fontSize:11, color:'var(--muted-foreground)'}}>{a.subtype || a.type} · {a.transaction_count} transactions</div>
+                    {a.events.map((e, idx) => (
+                      <div key={idx} style={{fontSize:11, color:'var(--muted-foreground)'}}>
+                        {e.occurred_on} · {e.title}{e.amount_cents !== null ? ` · ${fmtCurrency(e.amount_cents, {full:true})}` : ''}
+                      </div>
+                    ))}
+                  </td>
+                  <td className={`text-right mono ${(a.current_balance_cents || 0) >= 0 ? '' : 'amt-neg'}`}>
+                    {a.current_balance_cents === null ? '—' : fmtCurrency(a.current_balance_cents, {full:true})}
+                  </td>
+                  <td className="text-right">
+                    <button className="btn btn--outline btn--sm" onClick={() => onNavigate && onNavigate(`/txns?account=${encodeURIComponent(a.canonical_account_id)}`)}>
+                      Transactions
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function NetWorthSummary() {
   const { dataVersion } = useContext(AppContext)
   const [data, setData] = useState(null)
@@ -1877,7 +1954,7 @@ function SimilarApplyModal({ prompt, categoryColors, onToggle, onToggleAll, onSe
   )
 }
 
-function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
+function TransactionsPage({ periodId, onDrillCategory, initialCategory, initialAccount }) {
   const { dataVersion, categoryColors, bumpDataVersion } = useContext(AppContext)
   const [txns, setTxns] = useState([])
   const [total, setTotal] = useState(0)
@@ -1901,7 +1978,7 @@ function TransactionsPage({ periodId, onDrillCategory, initialCategory }) {
     }, 350)
     return () => clearTimeout(handle)
   }, [searchInput])
-  const [accountFilter, setAccountFilter] = useState(null)
+  const [accountFilter, setAccountFilter] = useState(initialAccount || null)
   const [categoryFilter, setCategoryFilter] = useState(initialCategory || '')
   // '' | 'income' | 'expense' | 'transfer' — a sign question, answered server-side.
   const [flowFilter, setFlowFilter] = useState('')
@@ -6099,7 +6176,7 @@ export default function App() {
       break
     case '/txns':
       pageTitle = 'Transactions'
-      pageContent = <TransactionsPage periodId={periodId} key={route} initialCategory={routeParams.get('category')} />
+      pageContent = <TransactionsPage periodId={periodId} key={route} initialCategory={routeParams.get('category')} initialAccount={routeParams.get('account')} />
       break
     case '/income':
       pageTitle = 'Income'

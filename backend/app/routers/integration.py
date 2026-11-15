@@ -13,11 +13,15 @@ convention) or a removal. Upserts are idempotent on the client side.
 """
 import hmac
 import os
+import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.database import get_db
+from app.services import plaid_client, plaid_sync
+from app.services.crypto import is_encryption_configured
 
 router = APIRouter(prefix="/api/integration/v1", tags=["integration"])
 
@@ -146,5 +150,99 @@ async def item_transaction_changes(
 
         next_cursor = str(page[-1]["seq"]) if page else str(after)
         return {"changes": changes, "next_cursor": next_cursor, "has_more": has_more}
+    finally:
+        await db.close()
+
+
+class ImportItemRequest(BaseModel):
+    item_id: str
+    access_token: str
+    institution_id: Optional[str] = None
+    institution_name: Optional[str] = None
+
+
+@router.post("/items/import", dependencies=[Depends(require_integration_token)])
+async def import_item(req: ImportItemRequest) -> Dict[str, Any]:
+    """Take over a bank connection that BonusPilot already holds.
+
+    The access token is stored encrypted, the accounts are read, and one sync
+    runs. The token is never echoed back and never put in an error message. This
+    does NOT call Plaid's remove-item: the connection stays live for both apps.
+    Safe to repeat for the same item.
+    """
+    if not is_encryption_configured():
+        raise HTTPException(status_code=503, detail="ENCRYPTION_KEY is not configured")
+    db = await get_db()
+    try:
+        item_db_id = await plaid_sync.store_item(
+            db,
+            item_id=req.item_id,
+            access_token=req.access_token,
+            institution_id=req.institution_id,
+            institution_name=req.institution_name,
+        )
+        try:
+            details = plaid_client.fetch_item_accounts(req.access_token)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Plaid could not list this item's accounts")
+        accounts = await plaid_sync.store_accounts(db, item_db_id, details.get("accounts") or [])
+        try:
+            sync = await plaid_sync.sync_item(db, item_db_id)
+        except Exception:
+            raise HTTPException(status_code=502, detail="The first sync for this item failed")
+        return {
+            "item_id": req.item_id,
+            "account_count": len(accounts),
+            "sync": {k: sync[k] for k in ("added", "updated", "removed", "skipped_accounts")},
+        }
+    finally:
+        await db.close()
+
+
+class CampaignEventIn(BaseModel):
+    external_key: str = Field(min_length=1, max_length=200)
+    kind: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=1, max_length=300)
+    occurred_on: str
+    amount_cents: Optional[int] = None
+    account_ref: Optional[str] = Field(default=None, max_length=200)
+    source: str = Field(default="bonuspilot", max_length=40)
+
+
+@router.post("/campaign-events", dependencies=[Depends(require_integration_token)])
+async def upsert_campaign_event(event: CampaignEventIn) -> Dict[str, Any]:
+    """Store or update one campaign fact. Same external_key = same row."""
+    try:
+        datetime.date.fromisoformat(event.occurred_on)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="occurred_on must be an ISO date (YYYY-MM-DD)")
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO campaign_events
+                 (external_key, source, kind, title, occurred_on, amount_cents, account_ref, updated_at)
+               VALUES (?,?,?,?,?,?,?,datetime('now'))
+               ON CONFLICT(external_key) DO UPDATE SET
+                 source=excluded.source, kind=excluded.kind, title=excluded.title,
+                 occurred_on=excluded.occurred_on, amount_cents=excluded.amount_cents,
+                 account_ref=excluded.account_ref, updated_at=datetime('now')""",
+            (event.external_key, event.source, event.kind, event.title,
+             event.occurred_on, event.amount_cents, event.account_ref),
+        )
+        await db.commit()
+        return {"ok": True, "external_key": event.external_key}
+    finally:
+        await db.close()
+
+
+@router.get("/campaign-events", dependencies=[Depends(require_integration_token)])
+async def list_campaign_events() -> Dict[str, Any]:
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            """SELECT external_key, source, kind, title, occurred_on, amount_cents, account_ref
+               FROM campaign_events ORDER BY occurred_on DESC, id DESC"""
+        )
+        return {"events": [dict(r) for r in await cur.fetchall()]}
     finally:
         await db.close()
