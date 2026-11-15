@@ -26,6 +26,7 @@ from plaid.api import plaid_api
 from plaid.model.accounts_get_request import AccountsGetRequest
 from plaid.model.country_code import CountryCode
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
+from plaid.model.institutions_get_by_id_request import InstitutionsGetByIdRequest
 from plaid.model.item_remove_request import ItemRemoveRequest
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
@@ -133,10 +134,33 @@ def fetch_item_accounts(access_token: str) -> Dict[str, Any]:
     response = get_plaid_client().accounts_get(
         AccountsGetRequest(access_token=access_token)
     ).to_dict()
+    institution_id = (response.get("item") or {}).get("institution_id")
     return {
-        "institution_id": (response.get("item") or {}).get("institution_id"),
+        "institution_id": institution_id,
+        "institution_name": institution_name_for(institution_id),
         "accounts": response.get("accounts") or [],
     }
+
+
+def institution_name_for(institution_id) -> Optional[str]:
+    """The bank's display name for an institution id, or None if Plaid cannot say.
+
+    Best effort: a failed lookup must not block linking, and the id is never
+    stored where the name belongs.
+    """
+    if not institution_id:
+        return None
+    try:
+        response = get_plaid_client().institutions_get_by_id(
+            InstitutionsGetByIdRequest(
+                institution_id=institution_id,
+                country_codes=[CountryCode("US")],
+            )
+        ).to_dict()
+        return (response.get("institution") or {}).get("name")
+    except Exception as exc:
+        logger.warning("Could not look up institution name: %s", type(exc).__name__)
+        return None
 
 
 def transactions_sync(access_token: str, cursor: Optional[str] = None, count: int = 500) -> Dict[str, Any]:

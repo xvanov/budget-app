@@ -313,9 +313,11 @@ async def test_apply_rules_service(test_client, monkeypatch):
     """Service-level test: apply_rules categorizes uncategorized transactions matching the rule."""
     from app.database import get_db
     db = await get_db()
-
-    cursor = await db.execute("SELECT COUNT(*) FROM transactions")
-    row = await cursor.fetchone()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) FROM transactions")
+        row = await cursor.fetchone()
+    finally:
+        await db.close()
     if row[0] == 0:
         monkeypatch.setattr("app.services.categorizer.call_llm", _make_mock_llm())
         test_client.post("/api/import/samples")

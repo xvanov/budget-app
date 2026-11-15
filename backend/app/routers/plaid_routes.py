@@ -84,7 +84,7 @@ async def exchange(req: ExchangeRequest):
             item_id=exchanged["item_id"],
             access_token=exchanged["access_token"],
             institution_id=details.get("institution_id"),
-            institution_name=details.get("institution_id"),
+            institution_name=details.get("institution_name"),
         )
         accounts = await plaid_sync.store_accounts(db, item_db_id, details.get("accounts") or [])
         return {"item_db_id": item_db_id, "accounts": accounts, "account_count": len(accounts)}
