@@ -13,6 +13,7 @@ from app.routers import health, import_routes, transactions, accounts, context, 
 # Own import line on purpose: several agents are editing the shared one above, and
 # a one-name addition there is a guaranteed merge conflict for no benefit.
 from app.routers import merchants
+from app.routers import integration
 from app.services import plaid_scheduler
 from app.services.import_state import import_state
 
@@ -158,6 +159,7 @@ app.include_router(sankey.router)
 app.include_router(chat_correct.router)
 app.include_router(amazon.router)
 app.include_router(plaid_routes.router)
+app.include_router(integration.router)
 # Spending by vendor. Appended rather than slotted in, same merge-conflict reason
 # as the import above.
 app.include_router(merchants.router)

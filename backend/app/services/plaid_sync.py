@@ -68,6 +68,7 @@ def plaid_transaction_to_row(
         or ""
     )
     description = txn.get("original_description") or txn.get("name") or ""
+    pfc = txn.get("personal_finance_category") or {}
     return {
         "external_id": txn.get("transaction_id"),
         "source_platform": "plaid",
@@ -83,6 +84,10 @@ def plaid_transaction_to_row(
         "normalized_description": BaseParser.normalize_description(description),
         "pending": 1 if txn.get("pending") else 0,
         "pending_transaction_id": txn.get("pending_transaction_id"),
+        "plaid_pfc_primary": pfc.get("primary"),
+        "plaid_pfc_detailed": pfc.get("detailed"),
+        "payment_channel": txn.get("payment_channel"),
+        "counterparty_name": (txn.get("counterparties") or [{}])[0].get("name"),
     }
 
 
@@ -177,7 +182,15 @@ async def _account_map(db, item_db_id: int) -> Dict[str, str]:
     }
 
 
-async def _upsert_transaction(db, row: Dict[str, Any]) -> str:
+async def _log_change(db, item_db_id: int, external_id: str, op: str) -> None:
+    """Record one change for the BonusPilot integration feed (see database.py)."""
+    await db.execute(
+        "INSERT INTO integration_changes (item_db_id, external_id, op) VALUES (?,?,?)",
+        (item_db_id, external_id, op),
+    )
+
+
+async def _upsert_transaction(db, row: Dict[str, Any], item_db_id: int) -> str:
     """Insert or update one Plaid row. Returns 'added' | 'updated'.
 
     Exact identity only: the Plaid transaction_id, or the pending id it replaces.
@@ -202,15 +215,22 @@ async def _upsert_transaction(db, row: Dict[str, Any]) -> str:
                 """UPDATE transactions
                    SET external_id=?, posted_date=?, transaction_date=?, amount_cents=?,
                        merchant=?, description=?, normalized_description=?, pending=?,
-                       plaid_account_id=?, account_id=?
+                       plaid_account_id=?, account_id=?, pending_external_id=?,
+                       plaid_pfc_primary=?, plaid_pfc_detailed=?, payment_channel=?,
+                       counterparty_name=?
                    WHERE id=?""",
                 (
                     row["external_id"], row["posted_date"], row["transaction_date"],
                     row["amount_cents"], row["merchant"], row["description"],
                     row["normalized_description"], row["pending"], row["plaid_account_id"],
-                    row["account_id"], pending_row[0],
+                    row["account_id"], row["pending_transaction_id"],
+                    row["plaid_pfc_primary"], row["plaid_pfc_detailed"],
+                    row["payment_channel"], row["counterparty_name"], pending_row[0],
                 ),
             )
+            # The pending id is gone from Plaid's side; the posted id replaces it.
+            await _log_change(db, item_db_id, row["pending_transaction_id"], "removed")
+            await _log_change(db, item_db_id, row["external_id"], "upsert")
             return "updated"
 
     # Existence check is for REPORTING only (added vs updated counts).
@@ -225,8 +245,9 @@ async def _upsert_transaction(db, row: Dict[str, Any]) -> str:
         """INSERT INTO transactions
            (external_id, source_platform, source_file, account_id, plaid_account_id,
             posted_date, transaction_date, amount_cents, currency, merchant, description,
-            normalized_description, pending)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            normalized_description, pending, pending_external_id, plaid_pfc_primary,
+            plaid_pfc_detailed, payment_channel, counterparty_name)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(external_id) WHERE external_id IS NOT NULL DO UPDATE SET
              posted_date=excluded.posted_date,
              transaction_date=excluded.transaction_date,
@@ -236,14 +257,22 @@ async def _upsert_transaction(db, row: Dict[str, Any]) -> str:
              normalized_description=excluded.normalized_description,
              pending=excluded.pending,
              plaid_account_id=excluded.plaid_account_id,
-             account_id=excluded.account_id""",
+             account_id=excluded.account_id,
+             pending_external_id=excluded.pending_external_id,
+             plaid_pfc_primary=excluded.plaid_pfc_primary,
+             plaid_pfc_detailed=excluded.plaid_pfc_detailed,
+             payment_channel=excluded.payment_channel,
+             counterparty_name=excluded.counterparty_name""",
         (
             row["external_id"], row["source_platform"], row["source_file"], row["account_id"],
             row["plaid_account_id"], row["posted_date"], row["transaction_date"],
             row["amount_cents"], row["currency"], row["merchant"], row["description"],
-            row["normalized_description"], row["pending"],
+            row["normalized_description"], row["pending"], row["pending_transaction_id"],
+            row["plaid_pfc_primary"], row["plaid_pfc_detailed"], row["payment_channel"],
+            row["counterparty_name"],
         ),
     )
+    await _log_change(db, item_db_id, row["external_id"], "upsert")
     return "updated" if already_present else "added"
 
 
@@ -278,7 +307,7 @@ async def sync_item(db, item_db_id: int, client=None) -> Dict[str, Any]:
                     result["skipped_accounts"] += 1
                     continue
                 row = plaid_transaction_to_row(txn, account_id, source_file=f"plaid:{item['item_id']}")
-                outcome = await _upsert_transaction(db, row)
+                outcome = await _upsert_transaction(db, row, item_db_id)
                 result[outcome] += 1
                 if outcome == "added":
                     cur = await db.execute("SELECT last_insert_rowid()")
@@ -289,6 +318,7 @@ async def sync_item(db, item_db_id: int, client=None) -> Dict[str, Any]:
                 if not txn_id:
                     continue
                 await db.execute("DELETE FROM transactions WHERE external_id=?", (txn_id,))
+                await _log_change(db, item_db_id, txn_id, "removed")
                 result["removed"] += 1
 
             cursor_value = page.get("next_cursor")

@@ -288,6 +288,22 @@ async def init_db():
                 FOREIGN KEY (item_db_id) REFERENCES plaid_items(id)
             );
 
+            -- Change log for the BonusPilot integration. Every Plaid row that is
+            -- added, modified or removed by a sync gets one entry here, numbered
+            -- by seq. A consumer keeps the last seq it saw per item and asks for
+            -- everything after it. The entry stores only the external_id; the
+            -- current row is read when the change is served, and a missing row
+            -- is reported as removed.
+            CREATE TABLE IF NOT EXISTS integration_changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_db_id INTEGER NOT NULL,
+                external_id TEXT NOT NULL,
+                op TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_integration_changes_item
+                ON integration_changes(item_db_id, seq);
+
             -- ── Amazon ───────────────────────────────────────────────────────
             -- owner exists because the Amazon account is shared and each
             -- person's export arrives separately; the export carries no
@@ -432,6 +448,14 @@ async def init_db():
             ("refund_match_id", "ALTER TABLE transactions ADD COLUMN refund_match_id INTEGER"),
             ("refund_role", "ALTER TABLE transactions ADD COLUMN refund_role TEXT"),
             ("refund_partial", "ALTER TABLE transactions ADD COLUMN refund_partial INTEGER DEFAULT 0"),
+            # Plaid fields the BonusPilot integration needs. Plaid's personal
+            # finance category is what tells a paycheck from a transfer, so it
+            # must be kept, not discarded after the sync.
+            ("plaid_pfc_primary", "ALTER TABLE transactions ADD COLUMN plaid_pfc_primary TEXT"),
+            ("plaid_pfc_detailed", "ALTER TABLE transactions ADD COLUMN plaid_pfc_detailed TEXT"),
+            ("payment_channel", "ALTER TABLE transactions ADD COLUMN payment_channel TEXT"),
+            ("counterparty_name", "ALTER TABLE transactions ADD COLUMN counterparty_name TEXT"),
+            ("pending_external_id", "ALTER TABLE transactions ADD COLUMN pending_external_id TEXT"),
         ):
             try:
                 await db.execute(ddl)
